@@ -1,0 +1,10 @@
+# Configuration for `cargo audit` (run in CI; see .github/workflows/ci.yml).
+
+[advisories]
+ignore = [
+    # Marvin attack (RSA private-key timing side channel) in the `rsa` crate;
+    # no fixed release exists. `rsa` is a dev-dependency only, used by tests
+    # to generate throwaway keypairs for the local JWKS server — it is not
+    # part of the shipped library, which verifies via `jsonwebtoken`/`ring`.
+    "RUSTSEC-2023-0071",
+]

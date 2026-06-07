@@ -42,7 +42,20 @@ historical `[[oidc_issuers]]` TOML sections.
 - The signing algorithm is taken from the token header but the key is fixed by
   issuer config, so an attacker cannot downgrade an RS256 issuer to HS256:
   `DecodingKey::from_jwk` keys only verify the JWK's key family.
-- Unknown `kid`s trigger one JWKS refetch (key rotation) before rejecting.
+- Symmetric (`oct`) JWKS keys are never trusted: a JWKS endpoint is public, so
+  an `oct` key's secret is public too and anyone could mint tokens with it.
+  Only asymmetric keys with `use` absent or `"sig"` are eligible.
+- `nbf` is enforced when present; `exp`/`nbf` checks use jsonwebtoken's
+  default 60s leeway.
+- Unknown `kid`s trigger a JWKS refetch (key rotation) before rejecting,
+  rate-limited to one fetch per 30s per URL — unauthenticated bogus-`kid`
+  tokens can't amplify into a request storm against the issuer. Failed
+  JWKS/discovery fetches are negative-cached the same way, and concurrent
+  cache misses are single-flighted.
+- Issuer HTTP calls (discovery, JWKS) carry a 10s timeout; a hung issuer
+  can't stall token validation indefinitely.
+- Discovery documents must report the expected `issuer` value (per OIDC
+  Discovery validation); mismatched documents are rejected.
 
 ## Development
 
