@@ -10,7 +10,7 @@
 //! 2. If it matches a configured [`IssuerConfig`], resolve that issuer's
 //!    signing key — a shared secret from an env var (HS256), a static JWKS
 //!    URI, or OIDC discovery (`{issuer}/.well-known/openid-configuration`) —
-//!    and fully validate the token (signature, `exp`, optional `aud`).
+//!    and fully validate the token (signature, `exp`/`nbf`, optional `aud`).
 //! 3. Return normalized [`Claims`]; the caller decides what the identity may
 //!    do. A non-matching `iss` returns `None` so the caller can fall back to
 //!    its own auth scheme (gateway JWT secret, admin key, API keys, ...).
@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use base64::Engine;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -126,8 +126,20 @@ struct ResolvedIssuer {
 }
 
 struct CachedJwks {
-    keys: jsonwebtoken::jwk::JwkSet,
+    /// Keys from the most recent successful fetch; `None` until one succeeds.
+    keys: Option<jsonwebtoken::jwk::JwkSet>,
+    /// When `keys` was last successfully fetched (anchors [`JWKS_CACHE_TTL`]).
     fetched_at: std::time::Instant,
+    /// When a fetch was last *attempted*, success or failure (anchors
+    /// [`MIN_FETCH_INTERVAL`]).
+    last_attempt: std::time::Instant,
+}
+
+struct CachedDiscovery {
+    /// `Some` once discovery succeeded (cached for the process lifetime);
+    /// `None` records a failed attempt, retried after [`MIN_FETCH_INTERVAL`].
+    jwks_uri: Option<String>,
+    last_attempt: std::time::Instant,
 }
 
 /// Registry of trusted issuers with cached JWKS/discovery state.
@@ -137,11 +149,25 @@ struct CachedJwks {
 pub struct OidcRegistry {
     issuers: HashMap<String, ResolvedIssuer>,
     jwks_cache: RwLock<HashMap<String, CachedJwks>>,
-    discovered_uris: RwLock<HashMap<String, String>>,
+    discovered_uris: RwLock<HashMap<String, CachedDiscovery>>,
+    /// Serializes outbound discovery/JWKS fetches so concurrent cache misses
+    /// collapse into one HTTP request instead of a stampede.
+    fetch_lock: Mutex<()>,
     http: reqwest::Client,
 }
 
 const JWKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Floor between fetch attempts against the same URL. Bounds the
+/// JWKS/discovery request rate an unauthenticated client can induce (tokens
+/// with bogus `kid`s, tokens for an unreachable issuer); key rotation within
+/// the TTL is still picked up, at most this much later.
+const MIN_FETCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Issuer endpoints sit on the request path (a cache miss blocks token
+/// validation), so cap how long a slow or hung issuer can stall a request.
+/// reqwest has *no* timeout by default.
+const HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl OidcRegistry {
     /// Registry that trusts no issuers; `try_validate` always returns `None`.
@@ -200,11 +226,17 @@ impl OidcRegistry {
                 },
             );
         }
+        let http = reqwest::Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .connect_timeout(HTTP_TIMEOUT)
+            .build()
+            .map_err(|e| Error::Config(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
             issuers,
             jwks_cache: RwLock::new(HashMap::new()),
             discovered_uris: RwLock::new(HashMap::new()),
-            http: reqwest::Client::new(),
+            fetch_lock: Mutex::new(()),
+            http,
         })
     }
 
@@ -237,6 +269,10 @@ impl OidcRegistry {
 
         let mut validation = Validation::new(header.alg);
         validation.validate_exp = issuer.require_exp;
+        // `nbf` is enforced only when the claim is present (jsonwebtoken never
+        // requires it), but a token that says "not valid before X" must not
+        // authenticate before X.
+        validation.validate_nbf = true;
         if !issuer.require_exp {
             // jsonwebtoken's default `required_spec_claims` demands that `exp`
             // be *present* even when expiry checking is off; drop it so
@@ -268,7 +304,10 @@ impl OidcRegistry {
         let exp = token_data
             .claims
             .get("exp")
-            .and_then(|v| v.as_u64())
+            // jsonwebtoken validates a numeric `exp` of either JSON flavor
+            // (rounding floats), so mirror it: a float `exp` on a *validated*
+            // token must not surface as 0 ("no expiry") in the claims.
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.round() as u64)))
             .unwrap_or(0) as usize;
 
         let scopes = token_data
@@ -310,45 +349,105 @@ impl OidcRegistry {
         // Try the cache first.
         {
             let cache = self.jwks_cache.read().await;
-            if let Some(cached) = cache.get(jwks_uri) {
-                if cached.fetched_at.elapsed() < JWKS_CACHE_TTL {
-                    if let Some(jwk) = find_jwk(&cached.keys, kid) {
-                        return DecodingKey::from_jwk(jwk)
-                            .map_err(|e| Error::Auth(format!("invalid JWK: {e}")));
-                    }
-                    // kid not found in cached set — fall through to refresh,
-                    // which covers key rotation within the TTL window.
-                }
+            if let Some(outcome) = key_from_cache(cache.get(jwks_uri), kid, jwks_uri) {
+                return outcome;
             }
         }
 
-        let jwks = self.fetch_jwks(jwks_uri).await?;
-        let jwk = find_jwk(&jwks, kid).ok_or_else(|| {
-            Error::Auth(format!("no matching JWK found (kid={kid:?}) at {jwks_uri}"))
-        })?;
-        let key =
-            DecodingKey::from_jwk(jwk).map_err(|e| Error::Auth(format!("invalid JWK: {e}")))?;
+        // The cache can't answer; single-flight the refetch so concurrent
+        // misses (startup, key rotation) collapse into one HTTP request.
+        let _flight = self.fetch_lock.lock().await;
+        {
+            let cache = self.jwks_cache.read().await;
+            if let Some(outcome) = key_from_cache(cache.get(jwks_uri), kid, jwks_uri) {
+                return outcome;
+            }
+        }
 
+        let fetched = self.fetch_jwks(jwks_uri).await;
+        let now = std::time::Instant::now();
         let mut cache = self.jwks_cache.write().await;
-        cache.insert(
-            jwks_uri.to_string(),
-            CachedJwks {
-                keys: jwks,
-                fetched_at: std::time::Instant::now(),
-            },
-        );
-
-        Ok(key)
+        match fetched {
+            Ok(jwks) => {
+                let resolved = find_jwk(&jwks, kid)
+                    .ok_or_else(|| {
+                        Error::Auth(format!("no matching JWK found (kid={kid:?}) at {jwks_uri}"))
+                    })
+                    .and_then(|jwk| {
+                        DecodingKey::from_jwk(jwk)
+                            .map_err(|e| Error::Auth(format!("invalid JWK: {e}")))
+                    });
+                cache.insert(
+                    jwks_uri.to_string(),
+                    CachedJwks {
+                        keys: Some(jwks),
+                        fetched_at: now,
+                        last_attempt: now,
+                    },
+                );
+                resolved
+            }
+            Err(e) => {
+                // Negative-cache the failure (keeping any previously fetched
+                // keys) so a down issuer isn't refetched once per request.
+                cache
+                    .entry(jwks_uri.to_string())
+                    .and_modify(|c| c.last_attempt = now)
+                    .or_insert_with(|| CachedJwks {
+                        keys: None,
+                        fetched_at: now,
+                        last_attempt: now,
+                    });
+                Err(e)
+            }
+        }
     }
 
     async fn discover_jwks_uri(&self, issuer_url: &str) -> Result<String> {
         {
             let cache = self.discovered_uris.read().await;
-            if let Some(uri) = cache.get(issuer_url) {
-                return Ok(uri.clone());
+            if let Some(outcome) = discovery_from_cache(cache.get(issuer_url), issuer_url) {
+                return outcome;
             }
         }
 
+        // Single-flight, as in `resolve_jwks_key`.
+        let _flight = self.fetch_lock.lock().await;
+        {
+            let cache = self.discovered_uris.read().await;
+            if let Some(outcome) = discovery_from_cache(cache.get(issuer_url), issuer_url) {
+                return outcome;
+            }
+        }
+
+        let fetched = self.fetch_discovery(issuer_url).await;
+        let now = std::time::Instant::now();
+        let mut cache = self.discovered_uris.write().await;
+        match fetched {
+            Ok(jwks_uri) => {
+                cache.insert(
+                    issuer_url.to_string(),
+                    CachedDiscovery {
+                        jwks_uri: Some(jwks_uri.clone()),
+                        last_attempt: now,
+                    },
+                );
+                Ok(jwks_uri)
+            }
+            Err(e) => {
+                cache.insert(
+                    issuer_url.to_string(),
+                    CachedDiscovery {
+                        jwks_uri: None,
+                        last_attempt: now,
+                    },
+                );
+                Err(e)
+            }
+        }
+    }
+
+    async fn fetch_discovery(&self, issuer_url: &str) -> Result<String> {
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
             issuer_url.trim_end_matches('/')
@@ -365,6 +464,18 @@ impl OidcRegistry {
             ))
         })?;
 
+        // OIDC Discovery requires the document's `issuer` to match the URL
+        // the configuration was derived from; a mismatch means the keys we
+        // are about to trust belong to someone else (misrouted proxy,
+        // lookalike issuer).
+        let doc_issuer = doc.get("issuer").and_then(|v| v.as_str()).unwrap_or("");
+        if doc_issuer.trim_end_matches('/') != issuer_url.trim_end_matches('/') {
+            return Err(Error::Auth(format!(
+                "OIDC discovery at {discovery_url} reports issuer '{doc_issuer}', \
+                 expected '{issuer_url}'"
+            )));
+        }
+
         let jwks_uri = doc
             .get("jwks_uri")
             .and_then(|v| v.as_str())
@@ -374,9 +485,6 @@ impl OidcRegistry {
             .to_string();
 
         tracing::info!(%jwks_uri, "discovered JWKS endpoint");
-        let mut cache = self.discovered_uris.write().await;
-        cache.insert(issuer_url.to_string(), jwks_uri.clone());
-
         Ok(jwks_uri)
     }
 
@@ -407,17 +515,84 @@ pub fn peek_issuer(token: &str) -> Option<String> {
     value.get("iss")?.as_str().map(String::from)
 }
 
+/// Answer a key lookup from the cache, or decide that a fetch is warranted.
+/// `Some(result)` resolves the request from cached state (including
+/// rate-limited rejections); `None` means the caller should fetch.
+fn key_from_cache(
+    entry: Option<&CachedJwks>,
+    kid: Option<&str>,
+    jwks_uri: &str,
+) -> Option<Result<DecodingKey>> {
+    let entry = entry?;
+    if let Some(ref keys) = entry.keys {
+        if entry.fetched_at.elapsed() < JWKS_CACHE_TTL {
+            if let Some(jwk) = find_jwk(keys, kid) {
+                return Some(
+                    DecodingKey::from_jwk(jwk)
+                        .map_err(|e| Error::Auth(format!("invalid JWK: {e}"))),
+                );
+            }
+        }
+    }
+    // The cached keys can't validate this token. Refetching covers key
+    // rotation, TTL expiry, and recovery from a failed fetch — but not more
+    // often than MIN_FETCH_INTERVAL, so unauthenticated bogus-`kid` tokens
+    // and a down issuer can't turn every request into an HTTP fetch.
+    if entry.last_attempt.elapsed() < MIN_FETCH_INTERVAL {
+        return Some(Err(Error::Auth(format!(
+            "no matching JWK (kid={kid:?}) at {jwks_uri} (refetch rate-limited)"
+        ))));
+    }
+    None
+}
+
+/// Same contract as [`key_from_cache`], for OIDC discovery results.
+fn discovery_from_cache(
+    entry: Option<&CachedDiscovery>,
+    issuer_url: &str,
+) -> Option<Result<String>> {
+    let entry = entry?;
+    if let Some(ref uri) = entry.jwks_uri {
+        return Some(Ok(uri.clone()));
+    }
+    // Negative cache: a recent discovery attempt failed; don't hammer the
+    // issuer once per request while it is down.
+    if entry.last_attempt.elapsed() < MIN_FETCH_INTERVAL {
+        return Some(Err(Error::Auth(format!(
+            "OIDC discovery for {issuer_url} recently failed (retry rate-limited)"
+        ))));
+    }
+    None
+}
+
+/// Whether a JWKS key is one this library is willing to verify signatures
+/// against. A symmetric (`oct`) key in a JWKS is an instant forgery vector —
+/// the JWKS endpoint is public, so the key's secret is public and anyone
+/// could mint valid HMAC tokens with it — so reject those outright, along
+/// with keys marked for non-signature use.
+fn is_verification_jwk(jwk: &jsonwebtoken::jwk::Jwk) -> bool {
+    use jsonwebtoken::jwk::{AlgorithmParameters, PublicKeyUse};
+    if matches!(jwk.algorithm, AlgorithmParameters::OctetKey(_)) {
+        return false;
+    }
+    matches!(
+        jwk.common.public_key_use,
+        None | Some(PublicKeyUse::Signature)
+    )
+}
+
 fn find_jwk<'a>(
     jwks: &'a jsonwebtoken::jwk::JwkSet,
     kid: Option<&str>,
 ) -> Option<&'a jsonwebtoken::jwk::Jwk> {
+    let mut candidates = jwks.keys.iter().filter(|k| is_verification_jwk(k));
     match kid {
-        Some(kid) => jwks
-            .keys
-            .iter()
-            .find(|k| k.common.key_id.as_deref() == Some(kid)),
-        // Single-key JWKS — common with Kubernetes API servers.
-        None if jwks.keys.len() == 1 => jwks.keys.first(),
-        None => None,
+        Some(kid) => candidates.find(|k| k.common.key_id.as_deref() == Some(kid)),
+        // No `kid` in the header: unambiguous only when exactly one
+        // verification key is served — common with Kubernetes API servers.
+        None => match (candidates.next(), candidates.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
+        },
     }
 }
