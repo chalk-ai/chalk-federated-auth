@@ -49,6 +49,15 @@ pub struct Claims {
     /// Scopes/permissions, mapped from the issuer's configured scopes claim.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Chalk team identity, mapped from the issuer's configured team claim.
+    /// Generic OIDC issuers may omit it; tenant-aware callers should require it.
+    #[serde(default)]
+    pub team_id: Option<String>,
+    /// Chalk environment identity, mapped from the issuer's configured
+    /// environment claim. Generic OIDC issuers may omit it; environment-aware
+    /// callers should require it.
+    #[serde(default)]
+    pub environment_id: Option<String>,
 }
 
 /// Trusted external JWT issuer. Tokens whose `iss` claim matches `issuer` are
@@ -77,8 +86,10 @@ pub struct IssuerConfig {
     #[serde(default)]
     pub audience: Option<String>,
     /// Maps normalized claim names to token claim names. Supported keys:
-    ///   - `sub`    — which token claim becomes the identity (default: "sub")
-    ///   - `scopes` — which token claim supplies scopes (default: "scopes")
+    ///   - `sub`            — which token claim becomes the identity (default: "sub")
+    ///   - `scopes`         — which token claim supplies scopes (default: "scopes")
+    ///   - `team_id`        — which token claim supplies the Chalk team (default: "team_id")
+    ///   - `environment_id` — which token claim supplies the Chalk environment (default: "environment_id")
     #[serde(default)]
     pub claims_map: HashMap<String, String>,
     /// Whether to require the `exp` claim. Defaults to true.
@@ -122,6 +133,8 @@ struct ResolvedIssuer {
     audience: Option<String>,
     subject_claim: String,
     scopes_claim: String,
+    team_id_claim: String,
+    environment_id_claim: String,
     require_exp: bool,
 }
 
@@ -188,6 +201,16 @@ impl OidcRegistry {
                 .get("scopes")
                 .cloned()
                 .unwrap_or_else(|| "scopes".to_string());
+            let team_id_claim = c
+                .claims_map
+                .get("team_id")
+                .cloned()
+                .unwrap_or_else(|| "team_id".to_string());
+            let environment_id_claim = c
+                .claims_map
+                .get("environment_id")
+                .cloned()
+                .unwrap_or_else(|| "environment_id".to_string());
 
             issuers.insert(
                 c.issuer.clone(),
@@ -196,6 +219,8 @@ impl OidcRegistry {
                     audience: c.audience.clone(),
                     subject_claim,
                     scopes_claim,
+                    team_id_claim,
+                    environment_id_claim,
                     require_exp: c.require_exp,
                 },
             );
@@ -282,7 +307,20 @@ impl OidcRegistry {
             })
             .unwrap_or_default();
 
-        Ok(Claims { sub, exp, scopes })
+        let team_id = optional_string_claim(&token_data.claims, &issuer.team_id_claim, "team_id")?;
+        let environment_id = optional_string_claim(
+            &token_data.claims,
+            &issuer.environment_id_claim,
+            "environment_id",
+        )?;
+
+        Ok(Claims {
+            sub,
+            exp,
+            scopes,
+            team_id,
+            environment_id,
+        })
     }
 
     async fn resolve_key(
@@ -391,6 +429,20 @@ impl OidcRegistry {
         resp.json()
             .await
             .map_err(|e| Error::Auth(format!("JWKS parse from {uri} failed: {e}")))
+    }
+}
+
+fn optional_string_claim(
+    claims: &serde_json::Value,
+    token_claim: &str,
+    normalized_claim: &str,
+) -> Result<Option<String>> {
+    match claims.get(token_claim) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+        Some(_) => Err(Error::Auth(format!(
+            "token claim '{token_claim}' (mapped from {normalized_claim}) must be a non-empty string"
+        ))),
     }
 }
 

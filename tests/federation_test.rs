@@ -47,6 +47,11 @@ async fn hs256_roundtrip_and_claim_mapping() {
     config.claims_map = HashMap::from([
         ("sub".to_string(), "email".to_string()),
         ("scopes".to_string(), "permissions".to_string()),
+        ("team_id".to_string(), "chalk_team".to_string()),
+        (
+            "environment_id".to_string(),
+            "chalk_environment".to_string(),
+        ),
     ]);
     let registry = OidcRegistry::from_config(&[config]).expect("registry");
 
@@ -56,6 +61,8 @@ async fn hs256_roundtrip_and_claim_mapping() {
             "iss": "chalk-test-hs256",
             "email": "andy@chalk.ai",
             "permissions": ["team:admin"],
+            "chalk_team": "team-123",
+            "chalk_environment": "env-456",
             "exp": future_exp(),
         }),
     );
@@ -67,6 +74,76 @@ async fn hs256_roundtrip_and_claim_mapping() {
         .expect("token should validate");
     assert_eq!(claims.sub, "andy@chalk.ai");
     assert_eq!(claims.scopes, vec!["team:admin".to_string()]);
+    assert_eq!(claims.team_id.as_deref(), Some("team-123"));
+    assert_eq!(claims.environment_id.as_deref(), Some("env-456"));
+}
+
+#[tokio::test]
+async fn chalk_tenant_claims_use_default_names() {
+    let config = secret_issuer("chalk-test-tenant", "FED_TEST_SECRET_TENANT", "s3cret");
+    let registry = OidcRegistry::from_config(&[config]).expect("registry");
+    let token = hs256_token(
+        "s3cret",
+        &serde_json::json!({
+            "iss": "chalk-test-tenant",
+            "sub": "service-token-123",
+            "team_id": "team-123",
+            "environment_id": "env-456",
+            "exp": future_exp(),
+        }),
+    );
+
+    let claims = registry
+        .try_validate(&token)
+        .await
+        .expect("issuer should match")
+        .expect("token should validate");
+    assert_eq!(claims.team_id.as_deref(), Some("team-123"));
+    assert_eq!(claims.environment_id.as_deref(), Some("env-456"));
+}
+
+#[tokio::test]
+async fn optional_tenant_claims_may_be_absent() {
+    let config = secret_issuer("generic-oidc", "FED_TEST_SECRET_GENERIC", "s3cret");
+    let registry = OidcRegistry::from_config(&[config]).expect("registry");
+    let token = hs256_token(
+        "s3cret",
+        &serde_json::json!({ "iss": "generic-oidc", "sub": "user", "exp": future_exp() }),
+    );
+
+    let claims = registry
+        .try_validate(&token)
+        .await
+        .expect("issuer should match")
+        .expect("token should validate");
+    assert_eq!(claims.team_id, None);
+    assert_eq!(claims.environment_id, None);
+}
+
+#[tokio::test]
+async fn malformed_tenant_claim_is_rejected() {
+    let config = secret_issuer(
+        "chalk-test-bad-tenant",
+        "FED_TEST_SECRET_BAD_TENANT",
+        "s3cret",
+    );
+    let registry = OidcRegistry::from_config(&[config]).expect("registry");
+    let token = hs256_token(
+        "s3cret",
+        &serde_json::json!({
+            "iss": "chalk-test-bad-tenant",
+            "sub": "user",
+            "team_id": ["team-123"],
+            "exp": future_exp(),
+        }),
+    );
+
+    let error = registry
+        .try_validate(&token)
+        .await
+        .expect("issuer should match")
+        .expect_err("non-string tenant identity must be rejected");
+    assert!(error.to_string().contains("mapped from team_id"));
 }
 
 #[tokio::test]

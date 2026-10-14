@@ -23,17 +23,23 @@ let registry = OidcRegistry::from_config(&[
 // Per request:
 match registry.try_validate(bearer_token).await {
     None => { /* token's `iss` is not a trusted issuer — fall back to your own auth */ }
-    Some(Ok(claims)) => { /* authenticated; claims.sub is the Chalk user id */ }
+    Some(Ok(claims)) => {
+        /* authenticated; claims.sub is the Chalk user id and the optional
+           claims.team_id / claims.environment_id identify its Chalk tenant */
+    }
     Some(Err(e)) => { /* token claimed a trusted issuer but failed validation — reject */ }
 }
 ```
 
 Issuers can alternatively be configured with an explicit `jwks_uri`, or with
 `secret_env` for HS256 shared-secret validation. `claims_map` remaps which
-token claims populate `Claims::sub` / `Claims::scopes` (Chalk user tokens
-carry the user id in `sub`; service tokens carry permissions in
-`permissions`). The serde shape of `IssuerConfig` matches the gateway's
-historical `[[oidc_issuers]]` TOML sections.
+token claims populate `Claims::sub`, `Claims::scopes`, `Claims::team_id`, and
+`Claims::environment_id` (Chalk user tokens carry the user id in `sub`; service
+tokens carry permissions in `permissions`). Team and environment identities
+default to the Chalk-standard `team_id` and `environment_id` claim names and
+remain optional for generic OIDC issuers; tenant-aware services should require
+the identities they use for isolation. The serde shape of `IssuerConfig`
+matches the gateway's historical `[[oidc_issuers]]` TOML sections.
 
 ## Security notes
 
