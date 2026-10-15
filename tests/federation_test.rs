@@ -128,22 +128,108 @@ async fn malformed_tenant_claim_is_rejected() {
         "s3cret",
     );
     let registry = OidcRegistry::from_config(&[config]).expect("registry");
-    let token = hs256_token(
+    for field in ["team_id", "environment_id"] {
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!(["team-123"]),
+            serde_json::json!({"id": "team-123"}),
+            serde_json::json!(""),
+            serde_json::json!(" \t"),
+            serde_json::json!(" env-123"),
+            serde_json::json!("env-123 "),
+        ] {
+            let mut payload = serde_json::json!({
+                "iss": "chalk-test-bad-tenant", "sub": "user", "exp": future_exp(),
+            });
+            payload[field] = invalid.clone();
+            let token = hs256_token("s3cret", &payload);
+            let error = registry
+                .try_validate(&token)
+                .await
+                .expect("issuer should match")
+                .expect_err("present malformed tenant identity must be rejected");
+            assert!(
+                error.to_string().contains(&format!("mapped from {field}")),
+                "{field}={invalid}: {error}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn verified_payload_preserves_issuer_and_normalized_identity() {
+    let mut config = secret_issuer("chalk-verified", "FED_TEST_SECRET_VERIFIED", "s3cret");
+    config.claims_map = HashMap::from([
+        ("sub".into(), "email".into()),
+        ("team_id".into(), "chalk_team".into()),
+        ("environment_id".into(), "chalk_environment".into()),
+    ]);
+    let registry = OidcRegistry::from_config(&[config]).unwrap();
+    for (kind, subject) in [
+        ("user", "person@example.test"),
+        ("service-account", "sa-123"),
+    ] {
+        let payload = serde_json::json!({
+            "iss": "chalk-verified", "exp": future_exp(), "kind": kind,
+            "email": subject, "chalk_team": "team-a", "chalk_environment": "env-a",
+            // Unmapped names must never override the configured source.
+            "team_id": "team-b", "environment_id": "env-b",
+            "groups": ["deployers"], "nested": {"repo": "chalk-ai/test"},
+        });
+        let token = hs256_token("s3cret", &payload);
+        let verified = registry
+            .try_validate_with_payload(&token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(verified.issuer(), "chalk-verified");
+        assert_eq!(verified.payload(), &payload);
+        assert_eq!(verified.claims().sub, subject);
+        assert_eq!(verified.claims().team_id.as_deref(), Some("team-a"));
+        assert_eq!(verified.claims().environment_id.as_deref(), Some("env-a"));
+
+        let forged = hs256_token("attacker", &payload);
+        assert!(registry
+            .try_validate_with_payload(&forged)
+            .await
+            .unwrap()
+            .is_err());
+    }
+    let unknown = hs256_token(
         "s3cret",
         &serde_json::json!({
-            "iss": "chalk-test-bad-tenant",
-            "sub": "user",
-            "team_id": ["team-123"],
-            "exp": future_exp(),
+            "iss": "untrusted", "sub": "u", "exp": future_exp(),
         }),
     );
+    assert!(registry.try_validate_with_payload(&unknown).await.is_none());
+}
 
-    let error = registry
-        .try_validate(&token)
-        .await
-        .expect("issuer should match")
-        .expect_err("non-string tenant identity must be rejected");
-    assert!(error.to_string().contains("mapped from team_id"));
+#[tokio::test]
+async fn empty_or_whitespace_subject_is_rejected() {
+    let config = secret_issuer("chalk-blank-sub", "FED_TEST_SECRET_BLANK_SUB", "s3cret");
+    let registry = OidcRegistry::from_config(&[config]).unwrap();
+    for sub in ["", " \t", " user", "user "] {
+        let token = hs256_token(
+            "s3cret",
+            &serde_json::json!({
+                "iss": "chalk-blank-sub", "sub": sub, "exp": future_exp(),
+            }),
+        );
+        assert!(registry.try_validate(&token).await.unwrap().is_err());
+    }
+}
+
+#[test]
+fn duplicate_or_empty_issuer_configuration_is_rejected() {
+    let config = secret_issuer("chalk-duplicate", "FED_TEST_SECRET_DUPLICATE", "s3cret");
+    assert!(OidcRegistry::from_config(&[config.clone(), config.clone()]).is_err());
+    for name in ["", " \t"] {
+        let mut empty = config.clone();
+        empty.issuer = name.into();
+        assert!(OidcRegistry::from_config(&[empty]).is_err());
+    }
 }
 
 #[tokio::test]

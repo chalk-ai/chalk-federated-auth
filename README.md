@@ -41,6 +41,26 @@ remain optional for generic OIDC issuers; tenant-aware services should require
 the identities they use for isolation. The serde shape of `IssuerConfig`
 matches the gateway's historical `[[oidc_issuers]]` TOML sections.
 
+Applications that map additional claims (for example a CI repository to an
+agent name) should use `try_validate_with_payload` instead. Its `VerifiedToken`
+returns `claims()` for normalized identity, `issuer()` for the validated
+issuer, and `payload()` for the original, verified JSON. Do not decode the JWT
+again or use raw payload fields in place of mapped subject/team/environment
+claims. The existing `try_validate` API retains its return type and fallback
+behavior.
+
+Absent tenant claims remain compatible with generic OIDC and existing
+environment-dedicated tokens. Present null, non-string, empty, or surrounding-
+whitespace identifiers are rejected, as are blank subjects and duplicate
+issuer configurations. A dedicated service may bind a credential without
+tenant claims to its configured environment; a hosted service must require
+an authenticated tenant binding and check the environment's canonical team
+ownership against trusted metadata before using it. Claim normalization alone
+does not prove that relationship or authorize an operation. Interactive Chalk
+tokens may carry `env_permissions` instead of a single `environment_id`;
+resolving those grants and propagating a required tenant context are subsequent
+parts of CHA-11611, not guarantees of `VerifiedToken`.
+
 ## Security notes
 
 - `peek_issuer` reads the **unverified** `iss` claim purely to route the token

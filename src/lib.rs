@@ -60,6 +60,36 @@ pub struct Claims {
     pub environment_id: Option<String>,
 }
 
+/// A token validated against a configured issuer, retaining the exact verified
+/// payload for application-specific claim mapping. This type cannot be
+/// deserialized or constructed by callers; an unverified payload must never be
+/// substituted for the one whose signature was checked.
+#[derive(Debug, Clone)]
+pub struct VerifiedToken {
+    claims: Claims,
+    issuer: String,
+    payload: serde_json::Value,
+}
+
+impl VerifiedToken {
+    /// Normalized identity, including issuer-configured tenant claim mappings.
+    pub fn claims(&self) -> &Claims {
+        &self.claims
+    }
+
+    /// The configured issuer that verified this token.
+    pub fn issuer(&self) -> &str {
+        &self.issuer
+    }
+
+    /// Original claims after signature, issuer, expiry and audience validation.
+    /// Application mappings may read these claims without decoding the JWT
+    /// again. Use [`Self::claims`] for normalized subject and tenant identity.
+    pub fn payload(&self) -> &serde_json::Value {
+        &self.payload
+    }
+}
+
 /// Trusted external JWT issuer. Tokens whose `iss` claim matches `issuer` are
 /// validated against the issuer's keys (JWKS or shared secret).
 ///
@@ -165,6 +195,11 @@ impl OidcRegistry {
     pub fn from_config(configs: &[IssuerConfig]) -> Result<Self> {
         let mut issuers = HashMap::new();
         for c in configs {
+            if c.issuer.trim().is_empty() || issuers.contains_key(&c.issuer) {
+                return Err(Error::Config(
+                    "issuer must be non-empty and configured exactly once".into(),
+                ));
+            }
             let key_source = if let Some(ref env_name) = c.secret_env {
                 let secret = std::env::var(env_name).map_err(|_| {
                     Error::Config(format!(
@@ -241,6 +276,15 @@ impl OidcRegistry {
     /// Returns `None` if the token's `iss` claim doesn't match any configured
     /// issuer — the caller should fall back to its own auth scheme.
     pub async fn try_validate(&self, token: &str) -> Option<Result<Claims>> {
+        self.try_validate_with_payload(token)
+            .await
+            .map(|result| result.map(|verified| verified.claims))
+    }
+
+    /// Like [`Self::try_validate`], but also returns the verified issuer and
+    /// original claims for application-specific mapping. A recognized issuer's
+    /// validation failure must be rejected, never retried as another scheme.
+    pub async fn try_validate_with_payload(&self, token: &str) -> Option<Result<VerifiedToken>> {
         if self.issuers.is_empty() {
             return None;
         }
@@ -254,7 +298,7 @@ impl OidcRegistry {
         token: &str,
         iss: &str,
         issuer: &ResolvedIssuer,
-    ) -> Result<Claims> {
+    ) -> Result<VerifiedToken> {
         let header =
             decode_header(token).map_err(|e| Error::Auth(format!("invalid token header: {e}")))?;
 
@@ -282,6 +326,7 @@ impl OidcRegistry {
             .claims
             .get(&issuer.subject_claim)
             .and_then(|v| v.as_str())
+            .filter(|value| !value.trim().is_empty() && value.trim() == *value)
             .ok_or_else(|| {
                 Error::Auth(format!(
                     "token missing '{}' claim (mapped from sub)",
@@ -314,12 +359,16 @@ impl OidcRegistry {
             "environment_id",
         )?;
 
-        Ok(Claims {
-            sub,
-            exp,
-            scopes,
-            team_id,
-            environment_id,
+        Ok(VerifiedToken {
+            claims: Claims {
+                sub,
+                exp,
+                scopes,
+                team_id,
+                environment_id,
+            },
+            issuer: iss.to_owned(),
+            payload: token_data.claims,
         })
     }
 
@@ -438,8 +487,12 @@ fn optional_string_claim(
     normalized_claim: &str,
 ) -> Result<Option<String>> {
     match claims.get(token_claim) {
-        None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+        None => Ok(None),
+        Some(serde_json::Value::String(value))
+            if !value.trim().is_empty() && value.trim() == value =>
+        {
+            Ok(Some(value.clone()))
+        }
         Some(_) => Err(Error::Auth(format!(
             "token claim '{token_claim}' (mapped from {normalized_claim}) must be a non-empty string"
         ))),
