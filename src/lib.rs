@@ -26,6 +26,9 @@ use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+mod tenant;
+pub use tenant::{ChalkPrincipal, PrincipalKind, TenantContext};
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// Misconfiguration detected while building the registry.

@@ -58,8 +58,33 @@ an authenticated tenant binding and check the environment's canonical team
 ownership against trusted metadata before using it. Claim normalization alone
 does not prove that relationship or authorize an operation. Interactive Chalk
 tokens may carry `env_permissions` instead of a single `environment_id`;
-resolving those grants and propagating a required tenant context are subsequent
-parts of CHA-11611, not guarantees of `VerifiedToken`.
+use the tenant-binding API below to resolve those grants. `VerifiedToken`
+alone is a verified claim container, not an authorized tenant context.
+
+## Chalk tenant binding
+
+For platform-configured Chalk issuers, call `verified.chalk_principal()?`, then
+`principal.select_environment(request_selector)?`. Look up that environment's
+canonical owner in trusted metadata or a platform-provisioned inventory and
+call `principal.bind_environment(environment_id, owner_team_id)?`. Never pass
+a caller's team header or the JWT's own team claim as the owner. Bind on every
+request, even when signature verification is cached.
+
+The resulting immutable `TenantContext` contains issuer, subject, principal
+kind, canonical team, and environment. Check `tenant.permits(operation_permission)`
+before invoking the operation, and clone the context into asynchronous work.
+An environment selector cannot override a scoped credential, grant a user an
+unlisted environment, or cross a team boundary. Impersonation is restricted to
+the effective team. Exchange credentials, absent/unknown kinds, and malformed
+grant claims are rejected. User and service-account tokens must name a team;
+internal engine/metadata credentials may derive their missing team from trusted
+environment ownership. These rules operate on normalized mapped tenant fields.
+
+Tenant-managed third-party issuers must not be interpreted as Chalk identity
+authorities. Legacy dedicated deployments can retain their existing verifier
+without opting into this stricter contract. This library does not fetch metadata;
+the caller supplies canonical ownership and handles lookup failures by denying
+access. Provisioning and refreshing that inventory remain platform responsibilities.
 
 ## Security notes
 
