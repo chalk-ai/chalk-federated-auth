@@ -1,0 +1,1689 @@
+{
+  "generated_by": "scripts/generate_jwt_v2_fixtures.py",
+  "permissions": {
+    "insecure_unauthenticated": 1,
+    "authenticated": 2,
+    "query.online": 3,
+    "query.offline": 4,
+    "monitoring.create": 5,
+    "monitoring.read": 6,
+    "team.add": 7,
+    "team.delete": 8,
+    "team.list": 9,
+    "team.admin": 10,
+    "deploy.read": 11,
+    "deploy.create": 12,
+    "deploy.preview": 13,
+    "deploy.redeploy": 14,
+    "logs.list": 15,
+    "cron.read": 16,
+    "cron.create": 17,
+    "secrets.write": 18,
+    "secrets.decrypt": 19,
+    "secrets.list": 20,
+    "tokens.write": 21,
+    "tokens.list": 22,
+    "migrate.read": 23,
+    "migrate.plan": 24,
+    "migrate.execute": 25,
+    "project.create": 26,
+    "chalk.admin": 27,
+    "billing.read": 28,
+    "auth_service.manager": 29,
+    "infrastructure.read": 30,
+    "infrastructure.write": 31,
+    "environment.create": 32,
+    "internal.dataplane_status_update": 33,
+    "internal.working_token_exchange": 34,
+    "billing.write": 35,
+    "query.offline_read": 36,
+    "internal.resource_share_view": 37,
+    "internal.exchange_token_renew": 38,
+    "agents.write": 39,
+    "agents.read": 40,
+    "billing.publish_analytics": 41
+  },
+  "valid": [
+    {
+      "name": "user_single_env",
+      "kind": "user",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "env_permissions": {
+            "env_a": [
+              "query.online",
+              "deploy.read"
+            ]
+          }
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 1,
+          "env_permissions": {
+            "env_a": [
+              "query.online",
+              "deploy.read"
+            ]
+          },
+          "p": {
+            "e": {
+              "env_a": "CAg"
+            }
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "e": {
+              "env_a": "CAg"
+            }
+          }
+        }
+      },
+      "expected": {
+        "env": {
+          "env_a": [
+            3,
+            11
+          ]
+        },
+        "team": null,
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "user_multi_env_empty_entry_and_team",
+      "kind": "user",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "env_permissions": {
+            "env_a": [
+              "query.online",
+              "deploy.read"
+            ],
+            "env_b": []
+          },
+          "team_permissions": [
+            "team.list",
+            "monitoring.read"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 1,
+          "env_permissions": {
+            "env_a": [
+              "query.online",
+              "deploy.read"
+            ],
+            "env_b": []
+          },
+          "team_permissions": [
+            "team.list",
+            "monitoring.read"
+          ],
+          "p": {
+            "e": {
+              "env_a": "CAg",
+              "env_b": ""
+            },
+            "t": "QAI"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "e": {
+              "env_a": "CAg",
+              "env_b": ""
+            },
+            "t": "QAI"
+          }
+        }
+      },
+      "expected": {
+        "env": {
+          "env_a": [
+            3,
+            11
+          ],
+          "env_b": []
+        },
+        "team": [
+          6,
+          9
+        ],
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "user_impersonated",
+      "kind": "user",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_b",
+          "impersonated": true,
+          "impersonated_team_id": "team_b",
+          "env_permissions": {
+            "env_c": [
+              "deploy.read"
+            ]
+          }
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_b",
+          "impersonated": true,
+          "impersonated_team_id": "team_b",
+          "v": 1,
+          "env_permissions": {
+            "env_c": [
+              "deploy.read"
+            ]
+          },
+          "p": {
+            "e": {
+              "env_c": "AAg"
+            }
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_b",
+          "impersonated": true,
+          "impersonated_team_id": "team_b",
+          "v": 2,
+          "p": {
+            "e": {
+              "env_c": "AAg"
+            }
+          }
+        }
+      },
+      "expected": {
+        "env": {
+          "env_c": [
+            11
+          ]
+        },
+        "team": null,
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "user_unknown_permissions_ignored",
+      "kind": "user",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "env_permissions": {
+            "env_a": [
+              "query.online",
+              "fixture.unknown_permission"
+            ]
+          }
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 1,
+          "env_permissions": {
+            "env_a": [
+              "query.online",
+              "fixture.unknown_permission"
+            ]
+          },
+          "p": {
+            "e": {
+              "env_a": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"
+            }
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "e": {
+              "env_a": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAE"
+            }
+          }
+        }
+      },
+      "expected": {
+        "env": {
+          "env_a": [
+            3
+          ]
+        },
+        "team": null,
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "user_all_known_permissions",
+      "kind": "user",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "env_permissions": {
+            "env_a": [
+              "agents.read",
+              "agents.write",
+              "auth_service.manager",
+              "billing.publish_analytics",
+              "billing.read",
+              "billing.write",
+              "chalk.admin",
+              "cron.create",
+              "cron.read",
+              "deploy.create",
+              "deploy.preview",
+              "deploy.read",
+              "deploy.redeploy",
+              "environment.create",
+              "infrastructure.read",
+              "infrastructure.write",
+              "internal.dataplane_status_update",
+              "internal.exchange_token_renew",
+              "internal.resource_share_view",
+              "internal.working_token_exchange",
+              "logs.list",
+              "migrate.execute",
+              "migrate.plan",
+              "migrate.read",
+              "monitoring.create",
+              "monitoring.read",
+              "project.create",
+              "query.offline",
+              "query.offline_read",
+              "query.online",
+              "secrets.decrypt",
+              "secrets.list",
+              "secrets.write",
+              "team.add",
+              "team.admin",
+              "team.delete",
+              "team.list",
+              "tokens.list",
+              "tokens.write"
+            ]
+          }
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 1,
+          "env_permissions": {
+            "env_a": [
+              "agents.read",
+              "agents.write",
+              "auth_service.manager",
+              "billing.publish_analytics",
+              "billing.read",
+              "billing.write",
+              "chalk.admin",
+              "cron.create",
+              "cron.read",
+              "deploy.create",
+              "deploy.preview",
+              "deploy.read",
+              "deploy.redeploy",
+              "environment.create",
+              "infrastructure.read",
+              "infrastructure.write",
+              "internal.dataplane_status_update",
+              "internal.exchange_token_renew",
+              "internal.resource_share_view",
+              "internal.working_token_exchange",
+              "logs.list",
+              "migrate.execute",
+              "migrate.plan",
+              "migrate.read",
+              "monitoring.create",
+              "monitoring.read",
+              "project.create",
+              "query.offline",
+              "query.offline_read",
+              "query.online",
+              "secrets.decrypt",
+              "secrets.list",
+              "secrets.write",
+              "team.add",
+              "team.admin",
+              "team.delete",
+              "team.list",
+              "tokens.list",
+              "tokens.write"
+            ]
+          },
+          "p": {
+            "e": {
+              "env_a": "-P____8D"
+            }
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "e": {
+              "env_a": "-P____8D"
+            }
+          }
+        }
+      },
+      "expected": {
+        "env": {
+          "env_a": [
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31,
+            32,
+            33,
+            34,
+            35,
+            36,
+            37,
+            38,
+            39,
+            40,
+            41
+          ]
+        },
+        "team": null,
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "user_highest_permission",
+      "kind": "user",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "env_permissions": {
+            "env_a": [
+              "billing.publish_analytics"
+            ]
+          }
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 1,
+          "env_permissions": {
+            "env_a": [
+              "billing.publish_analytics"
+            ]
+          },
+          "p": {
+            "e": {
+              "env_a": "AAAAAAAC"
+            }
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "e": {
+              "env_a": "AAAAAAAC"
+            }
+          }
+        }
+      },
+      "expected": {
+        "env": {
+          "env_a": [
+            41
+          ]
+        },
+        "team": null,
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "service_account_env_scoped",
+      "kind": "service-account",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "token_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "permissions": [
+            "query.online",
+            "deploy.create"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "token_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 1,
+          "permissions": [
+            "query.online",
+            "deploy.create"
+          ],
+          "p": {
+            "a": "CBA"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "token_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 2,
+          "p": {
+            "a": "CBA"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": [
+            3,
+            12
+          ]
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "service_account_team_scoped",
+      "kind": "service-account",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "token_b",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "team_permissions": [
+            "deploy.read"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "token_b",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "v": 1,
+          "team_permissions": [
+            "deploy.read"
+          ],
+          "p": {
+            "t": "AAg"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "token_b",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "t": "AAg"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": [
+          11
+        ],
+        "agent": {
+          "unrestricted": false,
+          "permissions": []
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "service_account_no_permissions",
+      "kind": "service-account",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "token_c",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "environment_id": "env_a"
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "token_c",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 1,
+          "p": {}
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "token_c",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 2,
+          "p": {}
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": []
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "sandbox",
+      "kind": "sandbox",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "sandbox_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "sandbox",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "sandbox_id": "sandbox_a",
+          "permissions": [
+            "query.online",
+            "deploy.read"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "sandbox_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "sandbox",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "sandbox_id": "sandbox_a",
+          "v": 1,
+          "permissions": [
+            "query.online",
+            "deploy.read"
+          ],
+          "p": {
+            "a": "CAg"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "sandbox_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "sandbox",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "sandbox_id": "sandbox_a",
+          "v": 2,
+          "p": {
+            "a": "CAg"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": [
+            3,
+            11
+          ]
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "tenant_unrestricted",
+      "kind": "tenant",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "chalkfs-sidecar",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "team_id": "team_a"
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "chalkfs-sidecar",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "team_id": "team_a",
+          "v": 1,
+          "p": {
+            "a": "*"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "chalkfs-sidecar",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "a": "*"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": true,
+          "permissions": []
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "tenant_restricted",
+      "kind": "tenant",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "fnq-consumer:queue_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "permissions": [
+            "query.online"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "fnq-consumer:queue_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 1,
+          "permissions": [
+            "query.online"
+          ],
+          "p": {
+            "a": "CA"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "fnq-consumer:queue_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 2,
+          "p": {
+            "a": "CA"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": [
+            3
+          ]
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "tenant_cluster_scoped_controller",
+      "kind": "tenant",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "dataplane-controller",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "cluster_id": "cluster_a",
+          "permissions": [
+            "internal.dataplane_status_update"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "dataplane-controller",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "cluster_id": "cluster_a",
+          "v": 1,
+          "permissions": [
+            "internal.dataplane_status_update"
+          ],
+          "p": {
+            "a": "AAAAAAI"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "dataplane-controller",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "cluster_id": "cluster_a",
+          "v": 2,
+          "p": {
+            "a": "AAAAAAI"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": [
+            33
+          ]
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "tenant_v2_without_restriction",
+      "kind": "tenant",
+      "payloads": {
+        "v2": {
+          "iss": "be",
+          "sub": "tenant_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {}
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": []
+        },
+        "requestable": null
+      },
+      "reader_overrides": {
+        "go-api-server": {
+          "reject": "tenant_missing_restriction"
+        },
+        "rust-permission-claims": {
+          "reject": "tenant_missing_restriction"
+        }
+      }
+    },
+    {
+      "name": "exchange_with_requestable",
+      "kind": "exchange",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "internal-service_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "exchange",
+          "team_id": "team_a",
+          "permissions": [
+            "internal.working_token_exchange"
+          ],
+          "requestable_perms": [
+            "query.online",
+            "deploy.read"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "internal-service_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "exchange",
+          "team_id": "team_a",
+          "v": 1,
+          "permissions": [
+            "internal.working_token_exchange"
+          ],
+          "requestable_perms": [
+            "query.online",
+            "deploy.read"
+          ],
+          "p": {
+            "a": "AAAAAAQ",
+            "r": "CAg"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "internal-service_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "exchange",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "a": "AAAAAAQ",
+            "r": "CAg"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": [
+            34
+          ]
+        },
+        "requestable": [
+          3,
+          11
+        ]
+      }
+    },
+    {
+      "name": "user_exchange",
+      "kind": "user-exchange",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user-exchange",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "permissions": [
+            "internal.working_token_exchange"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user-exchange",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 1,
+          "permissions": [
+            "internal.working_token_exchange"
+          ],
+          "p": {
+            "a": "AAAAAAQ"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user-exchange",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 2,
+          "p": {
+            "a": "AAAAAAQ"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": [
+            34
+          ]
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "service_token_exchange",
+      "kind": "service-token-exchange",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "token_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-token-exchange",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "permissions": [
+            "internal.working_token_exchange"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "token_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-token-exchange",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 1,
+          "permissions": [
+            "internal.working_token_exchange"
+          ],
+          "p": {
+            "a": "AAAAAAQ"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "token_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-token-exchange",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 2,
+          "p": {
+            "a": "AAAAAAQ"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": [
+            34
+          ]
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "sandbox_exchange",
+      "kind": "sandbox-exchange",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "sandbox_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "sandbox-exchange",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "sandbox_id": "sandbox_a",
+          "permissions": [
+            "internal.working_token_exchange"
+          ]
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "sandbox_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "sandbox-exchange",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "sandbox_id": "sandbox_a",
+          "v": 1,
+          "permissions": [
+            "internal.working_token_exchange"
+          ],
+          "p": {
+            "a": "AAAAAAQ"
+          }
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "sandbox_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "sandbox-exchange",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "sandbox_id": "sandbox_a",
+          "v": 2,
+          "p": {
+            "a": "AAAAAAQ"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": [
+            34
+          ]
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "engine",
+      "kind": "engine",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "engine_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "engine",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "project_id": "project_a"
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "engine_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "engine",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "project_id": "project_a",
+          "v": 1
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "engine_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "engine",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "project_id": "project_a",
+          "v": 2
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "metadata_service_agent",
+      "kind": "metadata-service-agent",
+      "payloads": {
+        "v1": {
+          "iss": "be",
+          "sub": "metadata-server",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "metadata-service-agent"
+        },
+        "v1_v2": {
+          "iss": "be",
+          "sub": "metadata-server",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "metadata-service-agent",
+          "v": 1
+        },
+        "v2": {
+          "iss": "be",
+          "sub": "metadata-server",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "metadata-service-agent",
+          "v": 2
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "v1_v2_ignores_malformed_p",
+      "kind": "user",
+      "payloads": {
+        "v1_v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 1,
+          "env_permissions": {
+            "env_a": [
+              "query.online"
+            ]
+          },
+          "p": "not-an-object"
+        }
+      },
+      "expected": {
+        "env": {
+          "env_a": [
+            3
+          ]
+        },
+        "team": null,
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "v2_accepts_untrimmed_bitset",
+      "kind": "user",
+      "payloads": {
+        "v2": {
+          "iss": "be",
+          "sub": "user_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "user",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "e": {
+              "env_a": "CAAA"
+            }
+          }
+        }
+      },
+      "expected": {
+        "env": {
+          "env_a": [
+            3
+          ]
+        },
+        "team": null,
+        "agent": null,
+        "requestable": null
+      }
+    },
+    {
+      "name": "service_account_v2_ignores_unused_field",
+      "kind": "service-account",
+      "payloads": {
+        "v2": {
+          "iss": "be",
+          "sub": "token_a",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "service-account",
+          "team_id": "team_a",
+          "environment_id": "env_a",
+          "v": 2,
+          "p": {
+            "a": "CA",
+            "e": {
+              "env_a": "AAg"
+            }
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": false,
+          "permissions": [
+            3
+          ]
+        },
+        "requestable": null
+      }
+    },
+    {
+      "name": "tenant_v2_ignores_unused_field",
+      "kind": "tenant",
+      "payloads": {
+        "v2": {
+          "iss": "be",
+          "sub": "chalkfs-sidecar",
+          "iat": 1767225600,
+          "exp": 4102444800,
+          "kind": "tenant",
+          "team_id": "team_a",
+          "v": 2,
+          "p": {
+            "a": "*",
+            "r": "CA"
+          }
+        }
+      },
+      "expected": {
+        "env": null,
+        "team": null,
+        "agent": {
+          "unrestricted": true,
+          "permissions": []
+        },
+        "requestable": null
+      }
+    }
+  ],
+  "reject": [
+    {
+      "name": "unknown_v",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": 3,
+        "p": {
+          "e": {
+            "env_a": "CA"
+          }
+        }
+      },
+      "reason": "unknown_v",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "v_wrong_type",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": "2",
+        "p": {
+          "e": {
+            "env_a": "CA"
+          }
+        }
+      },
+      "reason": "unknown_v",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "mixed_format",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": 2,
+        "p": {
+          "e": {
+            "env_a": "CA"
+          }
+        },
+        "env_permissions": {
+          "env_a": [
+            "query.online"
+          ]
+        }
+      },
+      "reason": "mixed_format",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "star_on_service_account",
+      "kind": "service-account",
+      "payload": {
+        "iss": "be",
+        "sub": "token_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "service-account",
+        "team_id": "team_a",
+        "environment_id": "env_a",
+        "v": 2,
+        "p": {
+          "a": "*"
+        }
+      },
+      "reason": "malformed_p",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "p_not_object",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": 2,
+        "p": "not-an-object"
+      },
+      "reason": "malformed_p",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "bitset_bad_characters",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": 2,
+        "p": {
+          "e": {
+            "env_a": "!!"
+          }
+        }
+      },
+      "reason": "malformed_p",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "bitset_padded",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": 2,
+        "p": {
+          "e": {
+            "env_a": "CA=="
+          }
+        }
+      },
+      "reason": "malformed_p",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "bitset_noncanonical",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": 2,
+        "p": {
+          "e": {
+            "env_a": "CB"
+          }
+        }
+      },
+      "reason": "malformed_p",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "bitset_newline",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": 2,
+        "p": {
+          "e": {
+            "env_a": "C\nA"
+          }
+        }
+      },
+      "reason": "malformed_p",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "bitset_bit_zero",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": 2,
+        "p": {
+          "e": {
+            "env_a": "CQ"
+          }
+        }
+      },
+      "reason": "malformed_p",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "e_not_object",
+      "kind": "user",
+      "payload": {
+        "iss": "be",
+        "sub": "user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "kind": "user",
+        "team_id": "team_a",
+        "v": 2,
+        "p": {
+          "e": "CA"
+        }
+      },
+      "reason": "malformed_p",
+      "readers": [
+        "all"
+      ]
+    },
+    {
+      "name": "no_kind",
+      "kind": null,
+      "payload": {
+        "iss": "https://api.chalk.ai",
+        "sub": "v1:env:env_a:user:user_a",
+        "iat": 1767225600,
+        "exp": 4102444800,
+        "aud": "sts.example.com",
+        "environment_id": "env_a"
+      },
+      "reason": "no_kind",
+      "readers": [
+        "all"
+      ]
+    }
+  ]
+}
