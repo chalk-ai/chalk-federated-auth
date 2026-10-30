@@ -1,5 +1,5 @@
 {
-  "generated_by": "scripts/generate_jwt_v2_fixtures.py",
+  "generated_by": "scripts/generate_jwt_v2_fixtures.py@5e301fe17fa01a253ca319b9364d86f524d49a90",
   "permissions": {
     "insecure_unauthenticated": 1,
     "authenticated": 2,
@@ -41,7 +41,8 @@
     "internal.exchange_token_renew": 38,
     "agents.write": 39,
     "agents.read": 40,
-    "billing.publish_analytics": 41
+    "billing.publish_analytics": 41,
+    "notebook.write": 42
   },
   "valid": [
     {
@@ -363,6 +364,7 @@
               "migrate.read",
               "monitoring.create",
               "monitoring.read",
+              "notebook.write",
               "project.create",
               "query.offline",
               "query.offline_read",
@@ -415,6 +417,7 @@
               "migrate.read",
               "monitoring.create",
               "monitoring.read",
+              "notebook.write",
               "project.create",
               "query.offline",
               "query.offline_read",
@@ -432,7 +435,7 @@
           },
           "p": {
             "e": {
-              "env_a": "-P____8D"
+              "env_a": "-P____8H"
             }
           }
         },
@@ -446,7 +449,7 @@
           "v": 2,
           "p": {
             "e": {
-              "env_a": "-P____8D"
+              "env_a": "-P____8H"
             }
           }
         }
@@ -492,7 +495,8 @@
             38,
             39,
             40,
-            41
+            41,
+            42
           ]
         },
         "team": null,
@@ -513,7 +517,7 @@
           "team_id": "team_a",
           "env_permissions": {
             "env_a": [
-              "billing.publish_analytics"
+              "notebook.write"
             ]
           }
         },
@@ -527,12 +531,12 @@
           "v": 1,
           "env_permissions": {
             "env_a": [
-              "billing.publish_analytics"
+              "notebook.write"
             ]
           },
           "p": {
             "e": {
-              "env_a": "AAAAAAAC"
+              "env_a": "AAAAAAAE"
             }
           }
         },
@@ -546,7 +550,7 @@
           "v": 2,
           "p": {
             "e": {
-              "env_a": "AAAAAAAC"
+              "env_a": "AAAAAAAE"
             }
           }
         }
@@ -554,7 +558,7 @@
       "expected": {
         "env": {
           "env_a": [
-            41
+            42
           ]
         },
         "team": null,
@@ -689,7 +693,8 @@
           "exp": 4102444800,
           "kind": "service-account",
           "team_id": "team_a",
-          "environment_id": "env_a"
+          "environment_id": "env_a",
+          "permissions": []
         },
         "v1_v2": {
           "iss": "be",
@@ -700,6 +705,7 @@
           "team_id": "team_a",
           "environment_id": "env_a",
           "v": 1,
+          "permissions": [],
           "p": {}
         },
         "v2": {
@@ -737,6 +743,7 @@
           "team_id": "team_a",
           "environment_id": "env_a",
           "sandbox_id": "sandbox_a",
+          "group_id": "group_a",
           "permissions": [
             "query.online",
             "deploy.read"
@@ -751,6 +758,7 @@
           "team_id": "team_a",
           "environment_id": "env_a",
           "sandbox_id": "sandbox_a",
+          "group_id": "group_a",
           "v": 1,
           "permissions": [
             "query.online",
@@ -769,6 +777,7 @@
           "team_id": "team_a",
           "environment_id": "env_a",
           "sandbox_id": "sandbox_a",
+          "group_id": "group_a",
           "v": 2,
           "p": {
             "a": "CAg"
@@ -976,6 +985,12 @@
         "go-api-server": {
           "reject": "tenant_missing_restriction"
         },
+        "engine": {
+          "reject": "tenant_missing_restriction"
+        },
+        "libchalk": {
+          "reject": "tenant_missing_restriction"
+        },
         "rust-permission-claims": {
           "reject": "tenant_missing_restriction"
         }
@@ -992,6 +1007,10 @@
           "exp": 4102444800,
           "kind": "exchange",
           "team_id": "team_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "permissions": [
             "internal.working_token_exchange"
           ],
@@ -1007,6 +1026,10 @@
           "exp": 4102444800,
           "kind": "exchange",
           "team_id": "team_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "v": 1,
           "permissions": [
             "internal.working_token_exchange"
@@ -1027,6 +1050,10 @@
           "exp": 4102444800,
           "kind": "exchange",
           "team_id": "team_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "v": 2,
           "p": {
             "a": "AAAAAAQ",
@@ -1061,6 +1088,11 @@
           "kind": "user-exchange",
           "team_id": "team_a",
           "environment_id": "env_a",
+          "cluster_id": "cluster_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "permissions": [
             "internal.working_token_exchange"
           ]
@@ -1073,6 +1105,11 @@
           "kind": "user-exchange",
           "team_id": "team_a",
           "environment_id": "env_a",
+          "cluster_id": "cluster_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "v": 1,
           "permissions": [
             "internal.working_token_exchange"
@@ -1089,6 +1126,11 @@
           "kind": "user-exchange",
           "team_id": "team_a",
           "environment_id": "env_a",
+          "cluster_id": "cluster_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "v": 2,
           "p": {
             "a": "AAAAAAQ"
@@ -1119,6 +1161,11 @@
           "kind": "service-token-exchange",
           "team_id": "team_a",
           "environment_id": "env_a",
+          "cluster_id": "cluster_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "permissions": [
             "internal.working_token_exchange"
           ]
@@ -1131,6 +1178,11 @@
           "kind": "service-token-exchange",
           "team_id": "team_a",
           "environment_id": "env_a",
+          "cluster_id": "cluster_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "v": 1,
           "permissions": [
             "internal.working_token_exchange"
@@ -1147,6 +1199,11 @@
           "kind": "service-token-exchange",
           "team_id": "team_a",
           "environment_id": "env_a",
+          "cluster_id": "cluster_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "v": 2,
           "p": {
             "a": "AAAAAAQ"
@@ -1177,6 +1234,11 @@
           "kind": "sandbox-exchange",
           "team_id": "team_a",
           "environment_id": "env_a",
+          "cluster_id": "cluster_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "sandbox_id": "sandbox_a",
           "permissions": [
             "internal.working_token_exchange"
@@ -1190,6 +1252,11 @@
           "kind": "sandbox-exchange",
           "team_id": "team_a",
           "environment_id": "env_a",
+          "cluster_id": "cluster_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "sandbox_id": "sandbox_a",
           "v": 1,
           "permissions": [
@@ -1207,6 +1274,11 @@
           "kind": "sandbox-exchange",
           "team_id": "team_a",
           "environment_id": "env_a",
+          "cluster_id": "cluster_a",
+          "aud": [
+            "internal.exchange"
+          ],
+          "gen": 1,
           "sandbox_id": "sandbox_a",
           "v": 2,
           "p": {
