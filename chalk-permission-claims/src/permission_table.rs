@@ -71,6 +71,10 @@ impl PermissionTable {
     pub fn knows(&self, index: PermissionIndex) -> bool {
         self.known.contains(index)
     }
+
+    pub(crate) fn known(&self) -> &PermissionSet {
+        &self.known
+    }
 }
 
 #[cfg(test)]
