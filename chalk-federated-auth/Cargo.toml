@@ -3,7 +3,7 @@ name = "chalk-federated-auth"
 version = "0.1.0"
 edition = "2021"
 description = "Federated JWT validation against trusted external issuers (Chalk's metadata API and friends): issuer matching, JWKS/OIDC discovery, and claim normalization."
-license = "UNLICENSED"
+license.workspace = true
 publish = false
 
 [dependencies]

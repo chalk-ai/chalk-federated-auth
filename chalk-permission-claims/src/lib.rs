@@ -12,7 +12,7 @@
 //!
 //! Each reader supplies a [`PermissionTable`] built from its own `chalk.auth.v1.Permission` enum,
 //! so permissions newer than the reader are dropped in either format. The fixture corpus in
-//! `testdata/jwt_v2`, generated in chalk-private, keeps this decoder in agreement with the Go,
+//! `testdata/jwt_v2`, generated alongside the token issuer, keeps this decoder in agreement with the Go,
 //! C++ and Python decoders.
 
 mod decode;

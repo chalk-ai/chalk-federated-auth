@@ -90,8 +90,8 @@ let can_query = decoded
 
 Permissions missing from the table are dropped in either format, so a reader never grants
 a permission it cannot name. Errors carry the reason codes of the shared fixture corpus in
-`chalk-permission-claims/testdata/jwt_v2`, which is generated in chalk-private and keeps
-this decoder in agreement with Chalk's Go, C++ and Python decoders. The corpus copy here is
+`chalk-permission-claims/testdata/jwt_v2`, which is generated alongside the token issuer and
+keeps this decoder in agreement with Chalk's Go, C++ and Python decoders. The corpus copy here is
 payload-only: no signed tokens and no keys.
 
 ## Development

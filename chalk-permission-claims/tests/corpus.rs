@@ -1,5 +1,5 @@
-//! Checks the decoder against the shared JWT Permissions V2 fixture corpus. Regenerate the
-//! corpus from chalk-private with `scripts/generate_jwt_v2_fixtures.py --out-dir`.
+//! Checks the decoder against the shared JWT Permissions V2 fixture corpus, which is generated
+//! alongside the token issuer.
 
 use chalk_permission_claims::{
     AgentGrant, DecodedPermissionClaims, PermissionIndex, PermissionSet, PermissionTable,

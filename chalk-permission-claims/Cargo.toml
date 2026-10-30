@@ -3,7 +3,7 @@ name = "chalk-permission-claims"
 version = "0.1.0"
 edition = "2021"
 description = "Decodes Chalk JWT permission claims in the V1 slug format or the V2 compact bitset format."
-license = "UNLICENSED"
+license.workspace = true
 publish = false
 
 [dependencies]
