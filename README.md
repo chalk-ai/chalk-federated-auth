@@ -79,17 +79,19 @@ use chalk_permission_claims::{PermissionIndex, PermissionTable};
 // Keep it in the struct that owns your auth and borrow it per request.
 let table = PermissionTable::new([(3, "query.online"), (11, "deploy.read")])?;
 
-// Per request, on the verified claims:
+// Per request, on the verified claims, with `environment_id: &str`:
 let decoded = table.decode(&claims)?;
 let can_query = decoded
     .env
     .as_ref()
-    .and_then(|envs| envs.get(&environment_id))
+    .and_then(|envs| envs.get(environment_id))
     .is_some_and(|set| set.contains(PermissionIndex::new(3)));
 ```
 
 Permissions missing from the table are dropped in either format, so a reader never grants
-a permission it cannot name. Errors carry the reason codes of the shared fixture corpus in
+a permission it cannot name. Decoding does not allowlist `kind`: an unrecognized kind decodes
+with every field `None`, so accept only the kinds you serve, and never read `agent: None` as
+unrestricted; only `AgentGrant::Unrestricted` is. Errors carry the reason codes of the shared fixture corpus in
 `chalk-permission-claims/testdata/jwt_v2`, which is generated alongside the token issuer and
 keeps this decoder in agreement with Chalk's Go, C++ and Python decoders. The corpus copy here is
 payload-only: no signed tokens and no keys.

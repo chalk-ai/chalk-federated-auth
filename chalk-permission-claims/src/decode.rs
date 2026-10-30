@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
@@ -69,6 +70,13 @@ impl EnvironmentId {
     }
 }
 
+// Sound because the derived Eq, Ord and Hash compare the inner `String` exactly as `str` does.
+impl Borrow<str> for EnvironmentId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A token's agent-level restriction. Only tenant tokens are ever unrestricted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentGrant {
@@ -77,7 +85,7 @@ pub enum AgentGrant {
 }
 
 /// A token's permissions independently of their encoding. `None` means the token does not carry
-/// that claim, or its kind does not use it.
+/// that claim, or its kind does not use it; an unrecognized kind leaves every field `None`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DecodedPermissionClaims {
     pub format: Format,
@@ -126,32 +134,26 @@ fn kind_fields(kind: &str) -> KindFields {
 
 impl PermissionTable {
     /// Reads a token's permission claims in the format its `v` claim selects: absent or 1 reads
-    /// the V1 claims, 2 reads `p`. Permissions this table does not know are dropped.
+    /// the V1 claims, 2 reads `p`. Permissions this table does not know are dropped. `kind` is not
+    /// allowlisted; see the crate docs.
     pub fn decode(
         &self,
         claims: &Map<String, Value>,
     ) -> Result<DecodedPermissionClaims, PermissionClaimsError> {
-        decode(self, claims)
+        let kind = match claims.get("kind") {
+            Some(Value::String(kind)) if !kind.is_empty() => kind.as_str(),
+            _ => return Err(PermissionClaimsError::NoKind),
+        };
+        let format = format_of(claims)?;
+        if format != Format::V2 {
+            // A dual token's V1 claims are authoritative, so `p` is not read at all.
+            return decode_v1(self, claims, kind, format);
+        }
+        if let Some(name) = V1_CLAIMS.into_iter().find(|name| present(claims, name)) {
+            return Err(PermissionClaimsError::MixedFormat(name));
+        }
+        decode_v2(self, claims, kind)
     }
-}
-
-fn decode(
-    table: &PermissionTable,
-    claims: &Map<String, Value>,
-) -> Result<DecodedPermissionClaims, PermissionClaimsError> {
-    let kind = match claims.get("kind") {
-        Some(Value::String(kind)) if !kind.is_empty() => kind.as_str(),
-        _ => return Err(PermissionClaimsError::NoKind),
-    };
-    let format = format_of(claims)?;
-    if format != Format::V2 {
-        // A dual token's V1 claims are authoritative, so `p` is not read at all.
-        return decode_v1(table, claims, kind, format);
-    }
-    if let Some(name) = V1_CLAIMS.into_iter().find(|name| present(claims, name)) {
-        return Err(PermissionClaimsError::MixedFormat(name));
-    }
-    decode_v2(table, claims, kind)
 }
 
 /// A null claim counts as absent, matching how Go decodes it into nil.
@@ -368,4 +370,42 @@ fn decode_agent(
         }
     }
     Ok(AgentGrant::Restricted(bitset_str(table, encoded, "p.a")?))
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::PermissionIndex;
+
+    #[test]
+    fn env_grants_look_up_by_str() {
+        let table = PermissionTable::new([(3, "query.online")]).expect("valid table");
+        let claims = json!({"kind": "user", "env_permissions": {"env_a": ["query.online"]}});
+        let decoded = table
+            .decode(claims.as_object().expect("object"))
+            .expect("decodes");
+        let envs = decoded.env.expect("user tokens carry env grants");
+        assert!(envs["env_a"].contains(PermissionIndex::new(3)));
+        assert!(!envs.contains_key("env_b"));
+    }
+
+    #[test]
+    fn unknown_kind_decodes_without_grants() {
+        let table = PermissionTable::new([(3, "query.online")]).expect("valid table");
+        let claims = json!({"kind": "not-a-kind", "permissions": ["query.online"]});
+        let decoded = table
+            .decode(claims.as_object().expect("object"))
+            .expect("decodes");
+        assert_eq!(
+            (
+                decoded.env,
+                decoded.team,
+                decoded.agent,
+                decoded.requestable
+            ),
+            (None, None, None, None)
+        );
+    }
 }

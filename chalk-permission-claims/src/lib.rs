@@ -10,6 +10,10 @@
 //! Decoding runs on claims whose signature has already been verified. It does not verify
 //! anything itself.
 //!
+//! Decoding does not allowlist `kind`: an unrecognized kind decodes with every field `None`, as
+//! in the Go, C++ and Python decoders. Callers must accept only the kinds they serve. `agent:
+//! None` never means unrestricted; only [`AgentGrant::Unrestricted`] does.
+//!
 //! Each reader supplies a [`PermissionTable`] built from its own `chalk.auth.v1.Permission` enum,
 //! so permissions newer than the reader are dropped in either format. The fixture corpus in
 //! `testdata/jwt_v2`, generated alongside the token issuer, keeps this decoder in agreement with the Go,

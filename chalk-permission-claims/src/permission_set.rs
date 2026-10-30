@@ -49,26 +49,20 @@ impl PermissionSet {
         // `URL_SAFE_NO_PAD` rejects padding, the standard alphabet, any other character, impossible
         // lengths, and non-zero unused bits in the last character, so only the canonical form decodes.
         let raw = URL_SAFE_NO_PAD.decode(encoded)?;
-        let mut set = Self::default();
-        for (byte_index, byte) in raw.iter().enumerate() {
-            for bit in 0..8 {
-                if byte & (1 << bit) == 0 {
-                    continue;
-                }
-                let n = byte_index * 8 + bit;
-                if n == 0 {
-                    return Err(BitsetError::BitZero);
-                }
-                let Ok(n) = u32::try_from(n) else {
-                    continue;
-                };
-                let index = PermissionIndex::new(n);
-                if table.knows(index) {
-                    set.insert(index);
-                }
-            }
+        if raw.first().is_some_and(|byte| byte & 1 != 0) {
+            return Err(BitsetError::BitZero);
         }
-        Ok(set)
+        // Byte i holds permissions 8i..8i+8, which is byte i % 8 of word i / 8. Bytes past
+        // capacity are dropped, then the AND drops permissions the table does not know.
+        let mut words = [0u64; CAPACITY / 64];
+        for (i, byte) in raw.iter().take(CAPACITY / 8).enumerate() {
+            words[i / 8] |= u64::from(*byte) << (8 * (i % 8));
+        }
+        let known = table.known();
+        for (word, known) in words.iter_mut().zip(known.words) {
+            *word &= known;
+        }
+        Ok(Self { words })
     }
 
     pub fn contains(&self, index: PermissionIndex) -> bool {
@@ -124,6 +118,16 @@ mod tests {
                 "{encoded:?}"
             );
         }
+    }
+
+    #[test]
+    fn decodes_bits_in_every_word() {
+        let table = PermissionTable::new([(3, "query.online"), (64, "low"), (127, "high")])
+            .expect("valid table");
+        // Bytes 0, 8 and 15 set permissions 3, 64 and 127.
+        let set =
+            PermissionSet::from_base64url(&table, "CAAAAAAAAAABAAAAAAAAgA").expect("canonical");
+        assert_eq!(indexes(&set), vec![3, 64, 127]);
     }
 
     #[test]

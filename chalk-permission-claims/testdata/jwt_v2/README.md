@@ -1,6 +1,7 @@
 # JWT Permissions V2 fixtures (payload-only)
 
-Generated alongside the token issuer. Do not edit; regenerate instead.
+Generated alongside the token issuer; `generated_by` in `cases.json` names the source commit.
+Do not edit; regenerate instead.
 
 - `cases.json`: decoded token payloads and the expected decode result. It carries no signed
   tokens and no keys: decoding permission claims happens after signature verification and
