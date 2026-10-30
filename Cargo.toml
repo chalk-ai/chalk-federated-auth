@@ -1,23 +1,6 @@
-[package]
-name = "chalk-federated-auth"
-version = "0.1.0"
-edition = "2021"
-description = "Federated JWT validation against trusted external issuers (Chalk's metadata API and friends): issuer matching, JWKS/OIDC discovery, and claim normalization."
-license = "UNLICENSED"
-publish = false
+[workspace]
+resolver = "2"
+members = ["chalk-federated-auth", "chalk-permission-claims"]
 
-[dependencies]
-base64 = "0.22"
-jsonwebtoken = "9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-thiserror = "2"
-tokio = { version = "1", features = ["sync"] }
-tracing = "0.1"
-
-[dev-dependencies]
-axum = "0.7"
-rand = "0.8"
-rsa = { version = "0.9", features = ["pem"] }
-tokio = { version = "1", features = ["full"] }
+[workspace.package]
+license = "Apache-2.0"

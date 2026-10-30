@@ -1,0 +1,12 @@
+[package]
+name = "chalk-permission-claims"
+version = "0.1.0"
+edition = "2021"
+description = "Decodes Chalk JWT permission claims in the V1 slug format or the V2 compact bitset format."
+license.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.22"
+serde_json = "1"
+thiserror = "2"
