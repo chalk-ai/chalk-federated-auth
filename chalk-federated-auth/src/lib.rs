@@ -19,18 +19,24 @@
 //! federating with it only requires `IssuerConfig::discovery("https://api.chalk.ai")`
 //! (signing keys rotate; never pin them).
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use base64::Engine;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+mod endpoint_cache;
+mod verification;
+use endpoint_cache::EndpointCache;
+use verification::VerificationCache;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// Misconfiguration detected while building the registry.
     #[error("config error: {0}")]
     Config(String),
+    /// Trusted identity infrastructure could not be reached or read.
+    #[error("authentication temporarily unavailable: {0}")]
+    Unavailable(String),
     /// Token failed validation (bad signature, claims, or key resolution).
     #[error("auth error: {0}")]
     Auth(String),
@@ -125,20 +131,14 @@ struct ResolvedIssuer {
     require_exp: bool,
 }
 
-struct CachedJwks {
-    keys: jsonwebtoken::jwk::JwkSet,
-    fetched_at: std::time::Instant,
-}
-
-/// Registry of trusted issuers with cached JWKS/discovery state.
-///
-/// Construct once at startup and share (it is internally synchronized);
-/// rebuilding per request would defeat the JWKS cache.
+/// Registry of trusted issuers with endpoint-owned discovery/JWKS refreshes.
+/// Construct once at startup and share; rebuilding defeats the key cache.
 pub struct OidcRegistry {
     issuers: HashMap<String, ResolvedIssuer>,
-    jwks_cache: RwLock<HashMap<String, CachedJwks>>,
-    discovered_uris: RwLock<HashMap<String, String>>,
+    jwks: EndpointCache<jsonwebtoken::jwk::JwkSet>,
+    discovery: EndpointCache<String>,
     http: reqwest::Client,
+    verifications: Arc<VerificationCache>,
 }
 
 const JWKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -202,9 +202,13 @@ impl OidcRegistry {
         }
         Ok(Self {
             issuers,
-            jwks_cache: RwLock::new(HashMap::new()),
-            discovered_uris: RwLock::new(HashMap::new()),
-            http: reqwest::Client::new(),
+            verifications: VerificationCache::new(),
+            jwks: EndpointCache::new(),
+            discovery: EndpointCache::new(),
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .map_err(|e| Error::Config(e.to_string()))?,
         })
     }
 
@@ -221,7 +225,14 @@ impl OidcRegistry {
         }
         let iss = peek_issuer(token)?;
         let issuer = self.issuers.get(&iss)?;
-        Some(self.validate_with_issuer(token, &iss, issuer).await)
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                self.validate_with_issuer(token, &iss, issuer),
+            )
+            .await
+            .unwrap_or_else(|_| Err(Error::Unavailable("token verification timed out".into()))),
+        )
     }
 
     async fn validate_with_issuer(
@@ -233,7 +244,7 @@ impl OidcRegistry {
         let header =
             decode_header(token).map_err(|e| Error::Auth(format!("invalid token header: {e}")))?;
 
-        let key = self.resolve_key(issuer, &header).await?;
+        let (key, revision) = self.resolve_key(issuer, &header).await?;
 
         let mut validation = Validation::new(header.alg);
         validation.validate_exp = issuer.require_exp;
@@ -250,48 +261,55 @@ impl OidcRegistry {
         }
         validation.set_issuer(&[iss]);
 
-        let token_data = decode::<serde_json::Value>(token, &key, &validation)
-            .map_err(|e| Error::Auth(format!("federated token invalid: {e}")))?;
+        let owned_token = token.to_owned();
+        let subject_claim = issuer.subject_claim.clone();
+        let scopes_claim = issuer.scopes_claim.clone();
+        self.verifications
+            .verify(token, revision, issuer.require_exp, move || {
+                let token_data = decode::<serde_json::Value>(&owned_token, &key, &validation)
+                    .map_err(|e| Error::Auth(format!("federated token invalid: {e}")))?;
 
-        let sub = token_data
-            .claims
-            .get(&issuer.subject_claim)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::Auth(format!(
-                    "token missing '{}' claim (mapped from sub)",
-                    issuer.subject_claim
-                ))
-            })?
-            .to_string();
+                let sub = token_data
+                    .claims
+                    .get(&subject_claim)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        Error::Auth(format!(
+                            "token missing '{}' claim (mapped from sub)",
+                            subject_claim
+                        ))
+                    })?
+                    .to_string();
 
-        let exp = token_data
-            .claims
-            .get("exp")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+                let exp = token_data
+                    .claims
+                    .get("exp")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
 
-        let scopes = token_data
-            .claims
-            .get(&issuer.scopes_claim)
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
+                let scopes = token_data
+                    .claims
+                    .get(&scopes_claim)
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                Ok(Claims { sub, exp, scopes })
             })
-            .unwrap_or_default();
-
-        Ok(Claims { sub, exp, scopes })
+            .await
     }
 
     async fn resolve_key(
         &self,
         issuer: &ResolvedIssuer,
         header: &jsonwebtoken::Header,
-    ) -> Result<DecodingKey> {
+    ) -> Result<(DecodingKey, u64)> {
         match &issuer.key_source {
-            KeySource::Secret(secret) => Ok(DecodingKey::from_secret(secret.as_bytes())),
+            KeySource::Secret(secret) => Ok((DecodingKey::from_secret(secret.as_bytes()), 0)),
             KeySource::Jwks { uri } => self.resolve_jwks_key(uri, header).await,
             KeySource::Discovery { issuer_url } => {
                 let jwks_uri = self.discover_jwks_uri(issuer_url).await?;
@@ -304,94 +322,71 @@ impl OidcRegistry {
         &self,
         jwks_uri: &str,
         header: &jsonwebtoken::Header,
-    ) -> Result<DecodingKey> {
+    ) -> Result<(DecodingKey, u64)> {
         let kid = header.kid.as_deref();
-
-        // Try the cache first.
-        {
-            let cache = self.jwks_cache.read().await;
-            if let Some(cached) = cache.get(jwks_uri) {
-                if cached.fetched_at.elapsed() < JWKS_CACHE_TTL {
-                    if let Some(jwk) = find_jwk(&cached.keys, kid) {
-                        return DecodingKey::from_jwk(jwk)
-                            .map_err(|e| Error::Auth(format!("invalid JWK: {e}")));
-                    }
-                    // kid not found in cached set — fall through to refresh,
-                    // which covers key rotation within the TTL window.
-                }
-            }
-        }
-
-        let jwks = self.fetch_jwks(jwks_uri).await?;
-        let jwk = find_jwk(&jwks, kid).ok_or_else(|| {
-            Error::Auth(format!("no matching JWK found (kid={kid:?}) at {jwks_uri}"))
-        })?;
-        let key =
-            DecodingKey::from_jwk(jwk).map_err(|e| Error::Auth(format!("invalid JWK: {e}")))?;
-
-        let mut cache = self.jwks_cache.write().await;
-        cache.insert(
-            jwks_uri.to_string(),
-            CachedJwks {
-                keys: jwks,
-                fetched_at: std::time::Instant::now(),
-            },
-        );
-
-        Ok(key)
+        let http = self.http.clone();
+        let uri = jwks_uri.to_owned();
+        let cached = self
+            .jwks
+            .get(
+                jwks_uri,
+                |cached| {
+                    let age = cached.fetched_at.elapsed();
+                    // A newly fetched set is authoritative even for absent kids.
+                    age < std::time::Duration::from_secs(1)
+                        || (age < JWKS_CACHE_TTL && find_jwk(&cached.value, kid).is_some())
+                },
+                move || async move { fetch_json(&http, &uri).await },
+            )
+            .await?;
+        let key = find_jwk(&cached.value, kid)
+            .ok_or_else(|| Error::Auth("no matching JWK found".into()))?;
+        DecodingKey::from_jwk(key)
+            .map(|key| (key, cached.revision))
+            .map_err(|e| Error::Auth(format!("invalid JWK: {e}")))
     }
 
     async fn discover_jwks_uri(&self, issuer_url: &str) -> Result<String> {
-        {
-            let cache = self.discovered_uris.read().await;
-            if let Some(uri) = cache.get(issuer_url) {
-                return Ok(uri.clone());
-            }
-        }
-
-        let discovery_url = format!(
+        let http = self.http.clone();
+        let url = format!(
             "{}/.well-known/openid-configuration",
             issuer_url.trim_end_matches('/')
         );
-        tracing::info!(%discovery_url, "performing OIDC discovery");
+        let cached = self
+            .discovery
+            .get(
+                issuer_url,
+                |_| true,
+                move || async move {
+                    let doc: serde_json::Value = fetch_json(&http, &url).await?;
+                    doc.get("jwks_uri")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            Error::Unavailable(format!("OIDC discovery at {url} has no jwks_uri"))
+                        })
+                },
+            )
+            .await?;
+        Ok(cached.value.clone())
+    }
+}
 
-        let resp =
-            self.http.get(&discovery_url).send().await.map_err(|e| {
-                Error::Auth(format!("OIDC discovery from {discovery_url} failed: {e}"))
-            })?;
-        let doc: serde_json::Value = resp.json().await.map_err(|e| {
-            Error::Auth(format!(
-                "OIDC discovery parse from {discovery_url} failed: {e}"
-            ))
+async fn fetch_json<T: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    url: &str,
+) -> Result<T> {
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|error| {
+            Error::Unavailable(format!("identity fetch from {url} failed: {error}"))
         })?;
-
-        let jwks_uri = doc
-            .get("jwks_uri")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                Error::Auth(format!("OIDC discovery at {discovery_url} has no jwks_uri"))
-            })?
-            .to_string();
-
-        tracing::info!(%jwks_uri, "discovered JWKS endpoint");
-        let mut cache = self.discovered_uris.write().await;
-        cache.insert(issuer_url.to_string(), jwks_uri.clone());
-
-        Ok(jwks_uri)
-    }
-
-    async fn fetch_jwks(&self, uri: &str) -> Result<jsonwebtoken::jwk::JwkSet> {
-        tracing::debug!(uri, "fetching JWKS");
-        let resp = self
-            .http
-            .get(uri)
-            .send()
-            .await
-            .map_err(|e| Error::Auth(format!("JWKS fetch from {uri} failed: {e}")))?;
-        resp.json()
-            .await
-            .map_err(|e| Error::Auth(format!("JWKS parse from {uri} failed: {e}")))
-    }
+    response.json().await.map_err(|error| {
+        Error::Unavailable(format!("identity response from {url} is invalid: {error}"))
+    })
 }
 
 /// Extract the `iss` claim from a JWT without validating it. Used to route a

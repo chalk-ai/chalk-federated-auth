@@ -39,7 +39,8 @@ let registry = OidcRegistry::from_config(&[
 match registry.try_validate(bearer_token).await {
     None => { /* token's `iss` is not a trusted issuer — fall back to your own auth */ }
     Some(Ok(claims)) => { /* authenticated; claims.sub is the Chalk user id */ }
-    Some(Err(e)) => { /* token claimed a trusted issuer but failed validation — reject */ }
+    Some(Err(chalk_federated_auth::Error::Unavailable(e))) => { /* retryable identity infrastructure/overload error; e.g. HTTP 503 */ }
+    Some(Err(e)) => { /* invalid credentials — reject */ }
 }
 ```
 
@@ -57,7 +58,41 @@ historical `[[oidc_issuers]]` TOML sections.
 - The signing algorithm is taken from the token header but the key is fixed by
   issuer config, so an attacker cannot downgrade an RS256 issuer to HS256:
   `DecodingKey::from_jwk` keys only verify the JWK's key family.
-- Unknown `kid`s trigger one JWKS refetch (key rotation) before rejecting.
+- Unknown `kid`s trigger a shared JWKS refetch for key rotation. A newly fetched
+  keyset is authoritative for one second, including when a requested key is absent.
+
+### Refreshes and verification
+
+Construct one registry and share it. Discovery and JWKS loads coalesce by trusted
+endpoint and continue in the background if a caller disconnects or times out.
+Followers do not consume admission slots. Each registry bounds each endpoint
+cache to 1,024 entries; process limits allow 256 active/queued endpoint attempts
+and 16 concurrent HTTP requests with FIFO admission. HTTP requests time out after
+two seconds; each endpoint attempt and each caller have a three-second total
+deadline. Failed HTTP calls and attempts that time out after HTTP admission back
+off for one second. Queue-only timeouts and local admission failures do not mark
+an endpoint failed.
+
+Fresh known signing keys bypass refresh, even while a rotation fetch is running
+or failing. Keysets expire after 300 seconds and then require successful refresh;
+expired keys are not reused during outages. Successful refresh replaces the
+keyset, including removing keys that the issuer no longer publishes.
+
+Once keys are available, identical tokens share signature validation on Tokio's
+blocking pool. A process semaphore limits concurrent checks to the available CPU
+count, capped at 16. No verification permit is held during discovery/JWKS waits.
+Each registry holds at most 4,096 pending/completed verification entries, keyed by
+token digest and keyset revision. Successful checks are reused for one second,
+with expiration checked on every reuse; failures are not memoized. Key resolution
+always precedes reuse, so these entries cannot bypass expired or replaced keys.
+These are library-internal optimizations; no token or unverified claims are logged.
+
+`Error::Auth` means credential validation failed. `Error::Unavailable` means the
+caller should retry: identity infrastructure, local capacity, or a deadline
+prevented validation. Consumers matching the error enum exhaustively must handle
+the new variant. Structured tracing events report refresh admission, completion,
+queue/fetch durations, and failure cooldown once per attempt, rather than once
+per waiting token.
 
 ## chalk-permission-claims
 
