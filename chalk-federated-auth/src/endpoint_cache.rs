@@ -4,13 +4,13 @@ use std::{
     future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, Weak,
+        Arc, Mutex,
     },
     time::Duration,
 };
 
 use futures_util::{
-    future::{BoxFuture, Shared},
+    future::{BoxFuture, Shared, WeakShared},
     FutureExt,
 };
 use tokio::{sync::OwnedSemaphorePermit, time::Instant};
@@ -30,11 +30,14 @@ pub(super) struct Cached<T> {
     pub fetched_at: Instant,
     pub revision: u64,
 }
-type Attempt<T> = Shared<BoxFuture<'static, Result<Arc<Cached<T>>>>>;
+type Work<T> = BoxFuture<'static, Result<Arc<Cached<T>>>>;
+type Attempt<T> = Shared<Work<T>>;
 
 struct State<T> {
     value: Option<Arc<Cached<T>>>,
-    inflight: Option<Attempt<T>>,
+    /// Weak, so the attempt lives only while its driver or a caller polls it:
+    /// when the runtime drops the driver, the attempt and its permits go too.
+    inflight: Option<WeakShared<Work<T>>>,
     failure: Option<(Instant, Error)>,
 }
 type Cell<T> = Arc<Mutex<State<T>>>;
@@ -88,21 +91,21 @@ impl<T: PartialEq + Send + Sync + 'static> EndpointCache<T> {
                     return Err(error.clone());
                 }
             }
-            if let Some(attempt) = &state.inflight {
-                attempt.clone()
+            if let Some(attempt) = state.inflight.as_ref().and_then(WeakShared::upgrade) {
+                attempt
             } else {
                 let lease = self.limits.inner.refreshes.clone().try_acquire_owned();
                 let lease = lease
                     .map_err(|_| Error::Unavailable("identity refresh capacity is busy".into()))?;
                 let attempt = start(
-                    Arc::downgrade(&cell),
+                    cell.clone(),
                     endpoint.to_owned(),
                     self.limits.clone(),
                     self.policy,
                     lease,
                     fetch,
                 );
-                state.inflight = Some(attempt.clone());
+                state.inflight = attempt.downgrade();
                 attempt
             }
         };
@@ -110,11 +113,8 @@ impl<T: PartialEq + Send + Sync + 'static> EndpointCache<T> {
     }
 }
 
-/// The attempt holds its cell weakly: the cell stores the attempt, so a strong
-/// reference would leak both, and the permits the attempt holds, once the
-/// spawned driver is dropped with its runtime.
 fn start<T, F, Fut>(
-    cell: Weak<Mutex<State<T>>>,
+    cell: Cell<T>,
     endpoint: String,
     limits: SharedLimits,
     policy: Policy,
@@ -162,17 +162,6 @@ where
         // Age keysets from the request start, which the response is at
         // least as fresh as; HTTP latency then never extends the window.
         let fetched_at = started.unwrap_or_else(Instant::now);
-        let Some(cell) = cell.upgrade() else {
-            // The cache is gone, so there is nothing to record; the permits
-            // drop with this future.
-            return result.map(|value| {
-                Arc::new(Cached {
-                    value,
-                    fetched_at,
-                    revision: NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
-                })
-            });
-        };
         let mut state = cell.lock().unwrap();
         state.inflight = None;
         let result = result.map(|value| match state.value.take() {
@@ -489,16 +478,19 @@ mod tests {
     }
 
     #[test]
-    fn a_cache_outliving_its_runtime_recovers_its_permits() {
+    fn a_stopped_driver_releases_permits_while_its_cache_survives() {
         let limits = SharedLimits::new(1, 1).unwrap();
-        let cache = start_hung_refresh(&runtime(), &limits);
-        assert_eq!(available(&limits), (0, 0), "nothing polls the attempt");
-        // The next caller polls the orphaned attempt; its timer belongs to the
-        // dead runtime, and the resulting panic ends the attempt as a failure.
-        let joined = runtime().block_on(cache.get("hung", |_| true, || async { Ok(7) }));
-        assert!(matches!(joined, Err(Error::Unavailable(_))));
-        assert_eq!(available(&limits), (1, 1));
-        drop(cache);
+        let orphaned = start_hung_refresh(&runtime(), &limits);
+        assert_eq!(
+            available(&limits),
+            (1, 1),
+            "the attempt stopped with its runtime"
+        );
+        // Another cache sharing the limits can refresh without anyone touching
+        // the orphaned endpoint, and that endpoint starts a fresh attempt.
+        drop(start_hung_refresh(&runtime(), &limits));
+        let fresh = runtime().block_on(orphaned.get("hung", |_| true, || async { Ok(7) }));
+        assert_eq!(fresh.unwrap().value, 7);
         assert_eq!(available(&limits), (1, 1));
     }
 }
