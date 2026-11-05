@@ -10,7 +10,7 @@
 //! 2. If it matches a configured [`IssuerConfig`], resolve that issuer's
 //!    signing key — a shared secret from an env var (HS256), a static JWKS
 //!    URI, or OIDC discovery (`{issuer}/.well-known/openid-configuration`) —
-//!    and fully validate the token (signature, `exp`, optional `aud`).
+//!    and fully validate the token (signature, `exp`/`nbf`, optional `aud`).
 //! 3. Return normalized [`Claims`]; the caller decides what the identity may
 //!    do. A non-matching `iss` returns `None` so the caller can fall back to
 //!    its own auth scheme (gateway JWT secret, admin key, API keys, ...).
@@ -135,12 +135,18 @@ struct ResolvedIssuer {
     require_exp: bool,
 }
 
+#[derive(PartialEq)]
+struct DiscoveryDocument {
+    issuer: String,
+    jwks_uri: String,
+}
+
 /// Registry of trusted issuers with endpoint-owned discovery/JWKS refreshes.
 /// Construct once at startup and share; rebuilding defeats the key cache.
 pub struct OidcRegistry {
     issuers: HashMap<String, ResolvedIssuer>,
     jwks: EndpointCache<jsonwebtoken::jwk::JwkSet>,
-    discovery: EndpointCache<String>,
+    discovery: EndpointCache<DiscoveryDocument>,
     http: reqwest::Client,
     verifications: ResultCache,
     jwks_ttl: Duration,
@@ -264,7 +270,7 @@ impl OidcRegistry {
         let header =
             decode_header(token).map_err(|e| Error::Auth(format!("invalid token header: {e}")))?;
 
-        let (key, revision) = self.resolve_key(issuer, &header).await?;
+        let (key, revision) = self.resolve_key(issuer, &header, iss).await?;
 
         let subject_claim = &issuer.subject_claim;
         let scopes_claim = &issuer.scopes_claim;
@@ -272,6 +278,7 @@ impl OidcRegistry {
             .verify(token, revision, issuer.require_exp, || {
                 let mut validation = Validation::new(header.alg);
                 validation.validate_exp = issuer.require_exp;
+                validation.validate_nbf = true;
                 if !issuer.require_exp {
                     // jsonwebtoken's default `required_spec_claims` demands that `exp`
                     // be *present* even when expiry checking is off; drop it so
@@ -303,7 +310,8 @@ impl OidcRegistry {
                 let exp = token_data
                     .claims
                     .get("exp")
-                    .and_then(|v| v.as_u64())
+                    // Match jsonwebtoken's NumericDate parsing, which rounds floats.
+                    .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f.round() as u64)))
                     .unwrap_or(0) as usize;
 
                 let scopes = token_data
@@ -325,12 +333,13 @@ impl OidcRegistry {
         &self,
         issuer: &ResolvedIssuer,
         header: &jsonwebtoken::Header,
+        expected_issuer: &str,
     ) -> Result<(DecodingKey, u64)> {
         match &issuer.key_source {
             KeySource::Secret(secret) => Ok((DecodingKey::from_secret(secret.as_bytes()), 0)),
             KeySource::Jwks { uri } => self.resolve_jwks_key(uri, header).await,
             KeySource::Discovery { issuer_url } => {
-                let jwks_uri = self.discover_jwks_uri(issuer_url).await?;
+                let jwks_uri = self.discover_jwks_uri(issuer_url, expected_issuer).await?;
                 self.resolve_jwks_key(&jwks_uri, header).await
             }
         }
@@ -369,12 +378,13 @@ impl OidcRegistry {
             .map_err(|e| Error::Auth(format!("invalid JWK: {e}")))
     }
 
-    async fn discover_jwks_uri(&self, issuer_url: &str) -> Result<String> {
+    async fn discover_jwks_uri(&self, issuer_url: &str, expected_issuer: &str) -> Result<String> {
         let http = self.http.clone();
         let url = format!(
             "{}/.well-known/openid-configuration",
             issuer_url.trim_end_matches('/')
         );
+        let expected = expected_issuer.to_owned();
         let cached = self
             .discovery
             .get(
@@ -389,13 +399,33 @@ impl OidcRegistry {
                         .ok_or_else(|| {
                             Error::Unavailable(format!("OIDC discovery at {url} has no jwks_uri"))
                         })?;
+                    let doc_issuer = doc
+                        .get("issuer")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("");
+                    check_discovery_issuer(&url, doc_issuer, &expected)?;
                     tracing::info!(discovery_url = %url, %jwks_uri, "discovered JWKS endpoint");
-                    Ok(jwks_uri)
+                    Ok(DiscoveryDocument {
+                        issuer: doc_issuer.to_owned(),
+                        jwks_uri,
+                    })
                 },
             )
             .await?;
-        Ok(cached.value.clone())
+        // A discovery endpoint may be shared by multiple issuer configs. Check
+        // cached and coalesced results against this caller's trusted issuer too.
+        check_discovery_issuer(issuer_url, &cached.value.issuer, expected_issuer)?;
+        Ok(cached.value.jwks_uri.clone())
     }
+}
+
+fn check_discovery_issuer(url: &str, actual: &str, expected: &str) -> Result<()> {
+    if actual.trim_end_matches('/') != expected.trim_end_matches('/') {
+        return Err(Error::Auth(format!(
+            "OIDC discovery at {url} reports issuer '{actual}', expected '{expected}'"
+        )));
+    }
+    Ok(())
 }
 
 async fn fetch_json<T: serde::de::DeserializeOwned>(
@@ -432,13 +462,21 @@ fn find_jwk<'a>(
     jwks: &'a jsonwebtoken::jwk::JwkSet,
     kid: Option<&str>,
 ) -> Option<&'a jsonwebtoken::jwk::Jwk> {
+    use jsonwebtoken::jwk::{AlgorithmParameters, PublicKeyUse};
+    // JWKS are public: an oct key exposes its signing secret. Only asymmetric
+    // keys intended for signatures (or with no declared use) are eligible.
+    let mut candidates = jwks.keys.iter().filter(|key| {
+        !matches!(key.algorithm, AlgorithmParameters::OctetKey(_))
+            && matches!(
+                key.common.public_key_use,
+                None | Some(PublicKeyUse::Signature)
+            )
+    });
     match kid {
-        Some(kid) => jwks
-            .keys
-            .iter()
-            .find(|k| k.common.key_id.as_deref() == Some(kid)),
-        // Single-key JWKS — common with Kubernetes API servers.
-        None if jwks.keys.len() == 1 => jwks.keys.first(),
-        None => None,
+        Some(kid) => candidates.find(|key| key.common.key_id.as_deref() == Some(kid)),
+        None => {
+            let only = candidates.next()?;
+            candidates.next().is_none().then_some(only)
+        }
     }
 }

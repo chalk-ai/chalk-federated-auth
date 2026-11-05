@@ -331,3 +331,347 @@ async fn rs256_via_oidc_discovery() {
         .expect("issuer should match");
     assert!(result.is_err(), "forged signature must be rejected");
 }
+
+#[tokio::test]
+async fn future_nbf_rejected() {
+    let config = secret_issuer("chalk-test-nbf", "FED_TEST_SECRET_G", "s3cret");
+    let registry = OidcRegistry::from_config(&[config]).expect("registry");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock before epoch")
+        .as_secs();
+    let premature = hs256_token(
+        "s3cret",
+        &serde_json::json!({
+            "iss": "chalk-test-nbf", "sub": "u", "exp": future_exp(), "nbf": now + 600,
+        }),
+    );
+    let result = registry
+        .try_validate(&premature)
+        .await
+        .expect("issuer should match");
+    assert!(result.is_err(), "token with future nbf must be rejected");
+
+    // nbf in the past is fine (absence is covered by the other tests).
+    let mature = hs256_token(
+        "s3cret",
+        &serde_json::json!({
+            "iss": "chalk-test-nbf", "sub": "u", "exp": future_exp(), "nbf": now - 600,
+        }),
+    );
+    assert!(registry.try_validate(&mature).await.expect("match").is_ok());
+}
+
+#[tokio::test]
+async fn fractional_exp_is_normalized_not_dropped() {
+    let config = secret_issuer("chalk-test-floatexp", "FED_TEST_SECRET_H", "s3cret");
+    let registry = OidcRegistry::from_config(&[config]).expect("registry");
+
+    // Some issuers emit `exp` as a JSON float; jsonwebtoken validates it
+    // (rounding), so the normalized claims must not report 0 ("no expiry").
+    let exp = future_exp();
+    for (fraction, expected) in [(0.25, exp), (0.75, exp + 1)] {
+        let token = hs256_token(
+            "s3cret",
+            &serde_json::json!({
+                "iss": "chalk-test-floatexp", "sub": "u", "exp": (exp as f64) + fraction,
+            }),
+        );
+        let claims = registry
+            .try_validate(&token)
+            .await
+            .expect("issuer should match")
+            .expect("float exp in the future should validate");
+        assert_eq!(claims.exp, expected as usize);
+    }
+}
+
+fn gen_rsa_jwk(kid: &str) -> (EncodingKey, serde_json::Value) {
+    let mut rng = rand::thread_rng();
+    let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("generate RSA key");
+    let public_key = private_key.to_public_key();
+
+    let pem =
+        rsa::pkcs1::EncodeRsaPrivateKey::to_pkcs1_pem(&private_key, rsa::pkcs8::LineEnding::LF)
+            .expect("encode private key PEM");
+    let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes()).expect("private key");
+
+    let jwk = serde_json::json!({
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": kid,
+        "n": b64url(&public_key.n().to_bytes_be()),
+        "e": b64url(&public_key.e().to_bytes_be()),
+    });
+    (encoding_key, jwk)
+}
+
+async fn serve_local(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    format!("http://{addr}")
+}
+
+fn jwks_only_issuer(issuer: &str, jwks_uri: String) -> IssuerConfig {
+    IssuerConfig {
+        issuer: issuer.to_string(),
+        jwks_uri: Some(jwks_uri),
+        discovery_url: None,
+        secret_env: None,
+        audience: None,
+        claims_map: HashMap::new(),
+        require_exp: true,
+    }
+}
+
+#[tokio::test]
+async fn symmetric_jwks_keys_are_never_trusted() {
+    let k: &[u8] = b"public-by-construction";
+    let jwks_doc = serde_json::json!({
+        "keys": [{ "kty": "oct", "kid": "sym-1", "k": b64url(k) }]
+    });
+    let app = axum::Router::new().route(
+        "/jwks.json",
+        axum::routing::get(move || {
+            let doc = jwks_doc.clone();
+            async move { axum::Json(doc) }
+        }),
+    );
+    let base = serve_local(app).await;
+
+    let config = jwks_only_issuer("chalk-test-oct", format!("{base}/jwks.json"));
+    let registry = OidcRegistry::from_config(&[config]).expect("registry");
+
+    let mut header = Header::new(jsonwebtoken::Algorithm::HS256);
+    header.kid = Some("sym-1".to_string());
+    let forged = encode(
+        &header,
+        &serde_json::json!({ "iss": "chalk-test-oct", "sub": "attacker", "exp": future_exp() }),
+        &EncodingKey::from_secret(k),
+    )
+    .expect("encode forged token");
+    let result = registry
+        .try_validate(&forged)
+        .await
+        .expect("issuer should match");
+    assert!(result.is_err(), "oct JWKS key must not validate tokens");
+
+    // Nor may an oct key be selected via the single-key no-`kid` fallback.
+    let unkidded = encode(
+        &Header::default(),
+        &serde_json::json!({ "iss": "chalk-test-oct", "sub": "attacker", "exp": future_exp() }),
+        &EncodingKey::from_secret(k),
+    )
+    .expect("encode forged token");
+    let result = registry
+        .try_validate(&unkidded)
+        .await
+        .expect("issuer should match");
+    assert!(result.is_err(), "oct JWKS key must not validate tokens");
+}
+
+#[tokio::test]
+async fn discovery_issuer_mismatch_rejected() {
+    let (encoding_key, jwk) = gen_rsa_jwk("test-key-1");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let issuer = format!("http://{addr}");
+
+    let discovery_doc = serde_json::json!({
+        "issuer": "https://attacker.example.com",
+        "jwks_uri": format!("{issuer}/.well-known/jwks.json"),
+    });
+    let jwks_doc = serde_json::json!({ "keys": [jwk] });
+    let app = axum::Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            axum::routing::get(move || {
+                let doc = discovery_doc.clone();
+                async move { axum::Json(doc) }
+            }),
+        )
+        .route(
+            "/.well-known/jwks.json",
+            axum::routing::get(move || {
+                let doc = jwks_doc.clone();
+                async move { axum::Json(doc) }
+            }),
+        );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let registry =
+        OidcRegistry::from_config(&[IssuerConfig::discovery(issuer.clone())]).expect("registry");
+
+    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("test-key-1".to_string());
+    let token = encode(
+        &header,
+        &serde_json::json!({ "iss": issuer, "sub": "u", "exp": future_exp() }),
+        &encoding_key,
+    )
+    .expect("encode token");
+
+    let result = registry
+        .try_validate(&token)
+        .await
+        .expect("issuer should match");
+    let err = result.expect_err("mismatched discovery issuer must be rejected");
+    assert!(
+        err.to_string().contains("reports issuer"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_nbf_cannot_bypass_optional_claim_validation() {
+    let registry = OidcRegistry::from_config(&[secret_issuer(
+        "chalk-test-malformed-nbf",
+        "FED_TEST_SECRET_MALFORMED_NBF",
+        "s3cret",
+    )])
+    .unwrap();
+    for nbf in [
+        serde_json::json!("99999999999"),
+        serde_json::json!(true),
+        serde_json::json!({}),
+    ] {
+        let token = hs256_token(
+            "s3cret",
+            &serde_json::json!({
+                "iss":"chalk-test-malformed-nbf", "sub":"u", "exp":future_exp(), "nbf":nbf,
+            }),
+        );
+        assert!(matches!(
+            registry.try_validate(&token).await,
+            Some(Err(chalk_federated_auth::Error::Auth(_)))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn jwks_selection_counts_only_eligible_signature_keys() {
+    let (signing, mut signature_key) = gen_rsa_jwk("key-1");
+    // An absent use is eligible, too.
+    signature_key.as_object_mut().unwrap().remove("use");
+    let mut encryption_key = signature_key.clone();
+    encryption_key["use"] = serde_json::json!("enc");
+    let public_secret = b"public-by-construction";
+    let symmetric_key = serde_json::json!({"kty":"oct", "kid":"key-1", "k":b64url(public_secret)});
+    let mut second_signature_key = signature_key.clone();
+    second_signature_key["kid"] = serde_json::json!("key-2");
+    for (keys, with_kid, without_kid) in [
+        (
+            serde_json::json!([encryption_key, symmetric_key, signature_key]),
+            true,
+            true,
+        ),
+        (serde_json::json!([encryption_key]), false, false),
+        (
+            serde_json::json!([signature_key, second_signature_key]),
+            true,
+            false,
+        ),
+    ] {
+        let doc = serde_json::json!({"keys":keys});
+        let url = serve_local(axum::Router::new().route(
+            "/",
+            axum::routing::get(move || std::future::ready(axum::Json(doc.clone()))),
+        ))
+        .await;
+        let registry = OidcRegistry::from_config(&[jwks_only_issuer("selection", url)]).unwrap();
+        for (kid, expected) in [(Some("key-1"), with_kid), (None, without_kid)] {
+            let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+            header.kid = kid.map(String::from);
+            let token = encode(
+                &header,
+                &serde_json::json!({
+                    "iss":"selection", "sub":"u", "exp":future_exp(),
+                }),
+                &signing,
+            )
+            .unwrap();
+            assert_eq!(
+                registry.try_validate(&token).await.unwrap().is_ok(),
+                expected
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cached_discovery_is_checked_against_each_configured_issuer() {
+    let (signing, jwk) = gen_rsa_jwk("key-1");
+    let keys = serde_json::json!({"keys":[jwk]});
+    let jwks_url = serve_local(axum::Router::new().route(
+        "/",
+        axum::routing::get(move || std::future::ready(axum::Json(keys.clone()))),
+    ))
+    .await;
+    let doc = serde_json::json!({"issuer":"issuer-a/", "jwks_uri":jwks_url});
+    let discovery_url = serve_local(axum::Router::new().route(
+        "/.well-known/openid-configuration",
+        axum::routing::get(move || std::future::ready(axum::Json(doc.clone()))),
+    ))
+    .await;
+    let configs: Vec<_> = ["issuer-a", "issuer-b"]
+        .into_iter()
+        .map(|issuer| IssuerConfig {
+            discovery_url: Some(discovery_url.clone()),
+            ..IssuerConfig::discovery(issuer)
+        })
+        .collect();
+    let registry = OidcRegistry::from_config(&configs).unwrap();
+    let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some("key-1".into());
+    for (issuer, expected) in [("issuer-a", true), ("issuer-b", false)] {
+        let token = encode(
+            &header,
+            &serde_json::json!({
+                "iss":issuer, "sub":"u", "exp":future_exp(),
+            }),
+            &signing,
+        )
+        .unwrap();
+        assert_eq!(
+            registry.try_validate(&token).await.unwrap().is_ok(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn discovery_without_an_issuer_is_rejected_before_fetching_keys() {
+    let doc = serde_json::json!({"jwks_uri":"http://127.0.0.1:1/must-not-fetch"});
+    let discovery_url = serve_local(axum::Router::new().route(
+        "/.well-known/openid-configuration",
+        axum::routing::get(move || std::future::ready(axum::Json(doc.clone()))),
+    ))
+    .await;
+    let registry = OidcRegistry::from_config(&[IssuerConfig {
+        discovery_url: Some(discovery_url),
+        ..IssuerConfig::discovery("missing-discovery-issuer")
+    }])
+    .unwrap();
+    let token = hs256_token(
+        "unused",
+        &serde_json::json!({
+            "iss":"missing-discovery-issuer", "sub":"u", "exp":future_exp(),
+        }),
+    );
+    assert!(matches!(
+        registry.try_validate(&token).await,
+        Some(Err(chalk_federated_auth::Error::Auth(_)))
+    ));
+}

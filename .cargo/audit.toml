@@ -1,0 +1,7 @@
+# The shipped library verifies signatures using AWS-LC. rsa is a dev-dependency
+# used only to generate throwaway RSA keypairs for local tests.
+[advisories]
+ignore = [
+    # Marvin attack: private-key timing side channel; no patched release exists.
+    "RUSTSEC-2023-0071",
+]

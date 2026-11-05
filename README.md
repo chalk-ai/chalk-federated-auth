@@ -58,6 +58,13 @@ historical `[[oidc_issuers]]` TOML sections.
 - The signing algorithm is taken from the token header but the key is fixed by
   issuer config, so an attacker cannot downgrade an RS256 issuer to HS256:
   `DecodingKey::from_jwk` keys only verify the JWK's key family.
+- Public JWKS endpoints may supply only asymmetric keys with `use` absent or
+  `"sig"`; symmetric (`oct`) and encryption keys are rejected. Shared-secret
+  validation remains available through `secret_env`.
+- `nbf` is enforced when present; `exp` and `nbf` use jsonwebtoken's default
+  60-second leeway. Fractional `exp` values are rounded during normalization.
+- Discovery documents must report the configured issuer (ignoring
+  trailing slashes) before their `jwks_uri` is trusted.
 - An unknown `kid` triggers a shared JWKS refresh, at most once per second per
   endpoint. If the refreshed keyset, or one requested within the last second,
   lacks the key, the token is rejected with `Error::Auth`. If a fetch failure,
@@ -170,4 +177,8 @@ payload-only: no signed tokens and no keys.
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
+cargo audit
 ```
+
+CI audits the workspace lockfile. `.cargo/audit.toml` documents the sole ignored
+advisory: the RSA private-key timing issue in the test-only key generator.
