@@ -1,11 +1,13 @@
 use std::{
+    collections::HashMap,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc, RwLock,
+        Arc, LazyLock, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use aws_lc_rs::signature::{Ed25519KeyPair, KeyPair};
 use axum::{http::StatusCode, routing::get, Json, Router};
 use base64::Engine;
 use chalk_federated_auth::{Error, IssuerConfig, OidcRegistry, RegistryOptions, SharedLimits};
@@ -100,9 +102,34 @@ impl KeyServer {
     }
 }
 
-fn jwks(kid: &str, secret: &str) -> Value {
-    json!({"keys": [{"kty": "oct", "alg": "HS256", "kid": kid,
-        "k": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret)}]})
+// Generate each throwaway asymmetric key once; all concurrent refresh tests
+// share small Ed25519 fixtures while retaining real signature verification.
+fn test_key(name: &str) -> &'static (EncodingKey, Value) {
+    static KEYS: LazyLock<HashMap<&str, (EncodingKey, Value)>> = LazyLock::new(|| {
+        [
+            SECRET,
+            "signing-secret-two",
+            "replacement-secret",
+            "attacker-secret",
+        ]
+        .into_iter()
+        .map(|name| {
+            let der =
+                Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new()).unwrap();
+            let key = Ed25519KeyPair::from_pkcs8(der.as_ref()).unwrap();
+            let public =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key.public_key().as_ref());
+            let jwk = json!({"kty":"OKP", "crv":"Ed25519", "alg":"EdDSA", "use":"sig", "x":public});
+            (name, (EncodingKey::from_ed_der(der.as_ref()), jwk))
+        })
+        .collect()
+    });
+    &KEYS[name]
+}
+fn jwks(kid: &str, key_name: &str) -> Value {
+    let mut jwk = test_key(key_name).1.clone();
+    jwk["kid"] = json!(kid);
+    json!({"keys": [jwk]})
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -112,15 +139,11 @@ fn now() -> u64 {
 }
 fn signed(claims: Value, kid: &str, secret: &str) -> String {
     let header = Header {
+        alg: jsonwebtoken::Algorithm::EdDSA,
         kid: Some(kid.into()),
         ..Header::default()
     };
-    encode(
-        &header,
-        &claims,
-        &EncodingKey::from_secret(secret.as_bytes()),
-    )
-    .unwrap()
+    encode(&header, &claims, &test_key(secret).0).unwrap()
 }
 fn token(issuer: &str, subject: &str, kid: &str, secret: &str) -> String {
     signed(
@@ -300,7 +323,7 @@ async fn caller_deadline_does_not_cancel_or_poison_shared_discovery_and_keys() {
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(Duration::from_millis(1400)).await;
-                    Json(json!({"jwks_uri":url}))
+                    Json(json!({"issuer":"deadline", "jwks_uri":url}))
                 }
             }
         }),
