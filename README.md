@@ -58,12 +58,12 @@ historical `[[oidc_issuers]]` TOML sections.
 - The signing algorithm is taken from the token header but the key is fixed by
   issuer config, so an attacker cannot downgrade an RS256 issuer to HS256:
   `DecodingKey::from_jwk` keys only verify the JWK's key family.
-- Unknown `kid`s trigger a shared JWKS refetch for key rotation. A newly fetched
-  keyset is authoritative for one second for keys it lacks: a token with such a
-  `kid` is rejected with `Error::Auth`, unless its `iat` is within 30 seconds
-  before the fetch or later, in which case the issuer may have published the key
-  since and the result is a retryable `Error::Unavailable`. `iat` is unverified,
-  so a forged token can only choose a 503 over a 401.
+- An unknown `kid` triggers a shared JWKS refresh, at most once per second per
+  endpoint. If the refreshed keyset, or one fetched within the last second,
+  lacks the key, the token is rejected with `Error::Auth`. If a fetch failure,
+  timeout, or capacity limit prevents the check, the result is
+  `Error::Unavailable`. Issuers must publish a key before signing with it: a
+  token signed with a key published within the last second can be rejected.
 
 ### Refreshes and verification
 
@@ -118,7 +118,7 @@ let registry = OidcRegistry::with_options(&issuers, options)?;
 | `refresh_deadline` | 3s | greater than `http_timeout` |
 | `validate_deadline` | `Some(3s)` | positive; `None` leaves it to the caller |
 | `failure_cooldown` | 1s | less than `jwks_ttl`; zero disables backoff |
-| `jwks_ttl` | 300s | greater than the 1s authoritative window |
+| `jwks_ttl` | 300s | greater than the 1s unknown-kid cooldown; at most 24h |
 | `endpoint_capacity` | 1,024 | at least the configured JWKS/discovery endpoints |
 | `result_cache_capacity` | 4,096 | zero disables result reuse |
 | `result_cache_ttl` | 1s | at most 60s; zero disables result reuse |

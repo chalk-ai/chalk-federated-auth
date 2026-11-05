@@ -21,7 +21,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use base64::Engine;
@@ -34,10 +34,6 @@ use endpoint_cache::{EndpointCache, Policy};
 use options::AUTHORITATIVE_WINDOW;
 pub use options::{RegistryOptions, SharedLimits};
 use verification::ResultCache;
-
-/// A token newer than this, relative to the keyset fetch, may be signed with a
-/// key the issuer published after that fetch.
-const KEY_PUBLICATION_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
@@ -281,7 +277,7 @@ impl OidcRegistry {
         let header =
             decode_header(token).map_err(|e| Error::Auth(format!("invalid token header: {e}")))?;
 
-        let (key, revision) = self.resolve_key(issuer, token, &header).await?;
+        let (key, revision) = self.resolve_key(issuer, &header).await?;
 
         let mut validation = Validation::new(header.alg);
         validation.validate_exp = issuer.require_exp;
@@ -341,15 +337,14 @@ impl OidcRegistry {
     async fn resolve_key(
         &self,
         issuer: &ResolvedIssuer,
-        token: &str,
         header: &jsonwebtoken::Header,
     ) -> Result<(DecodingKey, u64)> {
         match &issuer.key_source {
             KeySource::Secret(secret) => Ok((DecodingKey::from_secret(secret.as_bytes()), 0)),
-            KeySource::Jwks { uri } => self.resolve_jwks_key(uri, token, header).await,
+            KeySource::Jwks { uri } => self.resolve_jwks_key(uri, header).await,
             KeySource::Discovery { issuer_url } => {
                 let jwks_uri = self.discover_jwks_uri(issuer_url).await?;
-                self.resolve_jwks_key(&jwks_uri, token, header).await
+                self.resolve_jwks_key(&jwks_uri, header).await
             }
         }
     }
@@ -357,7 +352,6 @@ impl OidcRegistry {
     async fn resolve_jwks_key(
         &self,
         jwks_uri: &str,
-        token: &str,
         header: &jsonwebtoken::Header,
     ) -> Result<(DecodingKey, u64)> {
         let kid = header.kid.as_deref();
@@ -377,23 +371,12 @@ impl OidcRegistry {
                 move || async move { fetch_json(&http, &uri).await },
             )
             .await?;
-        let Some(key) = find_jwk(&cached.value, kid) else {
-            // A token issued after (or shortly before) this fetch may use a key
-            // the issuer published since; retry once the keyset is refetched.
-            // `iat` is unverified, so a forger can only choose a 503 over a 401.
-            let fetched = SystemTime::now()
-                .checked_sub(cached.fetched_at.elapsed())
-                .unwrap_or(UNIX_EPOCH);
-            let issued = peek_claim(token, "iat")
-                .and_then(|iat| iat.as_u64())
-                .map(|iat| UNIX_EPOCH + Duration::from_secs(iat));
-            return Err(match issued {
-                Some(issued) if issued + KEY_PUBLICATION_GRACE > fetched => Error::Unavailable(
-                    format!("signing key (kid={kid:?}) is not yet published at {jwks_uri}"),
-                ),
-                _ => Error::Auth(format!("no matching JWK found (kid={kid:?}) at {jwks_uri}")),
-            });
-        };
+        // A missing key is authoritative: the keyset was fetched within the
+        // last second or was just refreshed for this request. Issuers must
+        // publish a key before signing with it.
+        let key = find_jwk(&cached.value, kid).ok_or_else(|| {
+            Error::Auth(format!("no matching JWK found (kid={kid:?}) at {jwks_uri}"))
+        })?;
         DecodingKey::from_jwk(key)
             .map(|key| (key, cached.revision))
             .map_err(|e| Error::Auth(format!("invalid JWK: {e}")))
@@ -449,18 +432,13 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
 /// token to the right issuer before signature verification; never treat the
 /// result as authenticated.
 pub fn peek_issuer(token: &str) -> Option<String> {
-    peek_claim(token, "iss")?.as_str().map(String::from)
-}
-
-/// Read one claim from a JWT payload without validating it.
-fn peek_claim(token: &str, claim: &str) -> Option<serde_json::Value> {
     let payload_b64 = token.split('.').nth(1)?;
     let unpadded = payload_b64.trim_end_matches('=');
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(unpadded)
         .ok()?;
-    let mut value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value.get_mut(claim).map(serde_json::Value::take)
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get("iss")?.as_str().map(String::from)
 }
 
 fn find_jwk<'a>(

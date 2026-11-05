@@ -394,7 +394,7 @@ async fn invalid_identity_responses_are_unavailable_and_share_failure_backoff() 
 }
 
 #[tokio::test]
-async fn a_key_published_after_the_fetch_is_retryable_rather_than_rejected() {
+async fn a_key_missing_from_a_fresh_keyset_is_rejected_until_the_cooldown_allows_a_refresh() {
     let keys = KeyServer::new().await;
     let registry = OidcRegistry::from_config(&[keys.config("publish")]).unwrap();
     assert!(registry
@@ -402,25 +402,22 @@ async fn a_key_published_after_the_fetch_is_retryable_rather_than_rejected() {
         .await
         .unwrap()
         .is_ok());
-    // The issuer publishes and signs with a new key just after our fetch.
+    // The issuer starts signing with a key published after our fetch.
     *keys.keys.write().unwrap() = jwks("two", "signing-secret-two");
-    let fresh = token_issued_at("publish", now(), "two", "signing-secret-two");
-    assert!(
-        matches!(
-            registry.try_validate(&fresh).await,
-            Some(Err(Error::Unavailable(_)))
-        ),
-        "inside the authoritative window a new token's key may not be fetched yet"
+    let new = token("publish", "user", "two", "signing-secret-two");
+    for _ in 0..3 {
+        assert!(matches!(
+            registry.try_validate(&new).await,
+            Some(Err(Error::Auth(_)))
+        ));
+    }
+    assert_eq!(
+        keys.calls.load(Ordering::SeqCst),
+        1,
+        "the one-second cooldown absorbs repeated unknown kids"
     );
-    // A token issued well before the fetch had its key published already.
-    let stale = token_issued_at("publish", now() - 120, "two", "signing-secret-two");
-    assert!(matches!(
-        registry.try_validate(&stale).await,
-        Some(Err(Error::Auth(_)))
-    ));
-    assert_eq!(keys.calls.load(Ordering::SeqCst), 1);
     advance(2).await;
-    assert!(registry.try_validate(&fresh).await.unwrap().is_ok());
+    assert!(registry.try_validate(&new).await.unwrap().is_ok());
     assert_eq!(keys.calls.load(Ordering::SeqCst), 2);
 }
 
@@ -496,7 +493,7 @@ fn inconsistent_options_are_rejected_at_construction() {
         IssuerConfig::discovery("https://b.example"),
     ];
     type Change = fn(&mut RegistryOptions);
-    let invalid: [(&str, Change); 7] = [
+    let invalid: [(&str, Change); 8] = [
         ("zero http timeout", |o| o.http_timeout = Duration::ZERO),
         ("refresh deadline within the http timeout", |o| {
             o.refresh_deadline = o.http_timeout
@@ -506,6 +503,9 @@ fn inconsistent_options_are_rejected_at_construction() {
         }),
         ("keys shorter-lived than the authoritative window", |o| {
             o.jwks_ttl = Duration::from_secs(1)
+        }),
+        ("keys trusted for over a day", |o| {
+            o.jwks_ttl = Duration::from_secs(86_401)
         }),
         ("cooldown outlasting the keys", |o| {
             o.failure_cooldown = o.jwks_ttl
@@ -539,4 +539,21 @@ fn inconsistent_options_are_rejected_at_construction() {
     assert!(OidcRegistry::with_options(&issuers, custom).is_ok());
     assert!(matches!(SharedLimits::new(0, 1), Err(Error::Config(_))));
     assert!(matches!(SharedLimits::new(2, 1), Err(Error::Config(_))));
+}
+
+#[tokio::test]
+async fn an_unknown_kid_with_an_extreme_iat_is_rejected_without_panicking() {
+    let keys = KeyServer::new().await;
+    let registry = OidcRegistry::from_config(&[keys.config("overflow")]).unwrap();
+    assert!(registry
+        .try_validate(&token("overflow", "user", "one", SECRET))
+        .await
+        .unwrap()
+        .is_ok());
+    // Forged: unknown kid, so validation stops at key lookup, before the signature.
+    let forged = token_issued_at("overflow", u64::MAX, "forged-kid", "attacker-secret");
+    assert!(matches!(
+        registry.try_validate(&forged).await,
+        Some(Err(Error::Auth(_)))
+    ));
 }

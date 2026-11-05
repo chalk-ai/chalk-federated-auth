@@ -9,10 +9,13 @@ use tokio::sync::Semaphore;
 
 use crate::{Error, Result};
 
-/// How long a newly fetched keyset is authoritative for key IDs it lacks.
+/// Refresh cooldown for unknown key IDs: a keyset fetched this recently is
+/// authoritative, so a key it lacks is rejected without another fetch.
 /// Fixed: the refresh, backoff, and rotation rules are reasoned against it.
 pub(crate) const AUTHORITATIVE_WINDOW: Duration = Duration::from_secs(1);
 const MAX_RESULT_CACHE_TTL: Duration = Duration::from_secs(60);
+/// Bounds every duration added to a clock, so configuration cannot overflow one.
+const MAX_JWKS_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Process-level budgets for discovery/JWKS refreshes.
 ///
@@ -117,6 +120,7 @@ pub struct RegistryOptions {
     /// retries on the next request; concurrent requests still share one attempt.
     pub failure_cooldown: Duration,
     /// How long fetched signing keys are used before a refresh is required.
+    /// At most 24 hours.
     pub jwks_ttl: Duration,
     /// Distinct discovery or JWKS endpoints each registry tracks.
     pub endpoint_capacity: usize,
@@ -163,6 +167,12 @@ impl RegistryOptions {
         if self.jwks_ttl <= AUTHORITATIVE_WINDOW {
             return fail(format!(
                 "jwks_ttl ({:?}) must exceed {AUTHORITATIVE_WINDOW:?}",
+                self.jwks_ttl
+            ));
+        }
+        if self.jwks_ttl > MAX_JWKS_TTL {
+            return fail(format!(
+                "jwks_ttl ({:?}) must be at most {MAX_JWKS_TTL:?}",
                 self.jwks_ttl
             ));
         }
