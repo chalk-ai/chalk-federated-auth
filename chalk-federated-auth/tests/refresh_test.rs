@@ -8,7 +8,7 @@ use std::{
 
 use axum::{http::StatusCode, routing::get, Json, Router};
 use base64::Engine;
-use chalk_federated_auth::{Error, IssuerConfig, OidcRegistry};
+use chalk_federated_auth::{Error, IssuerConfig, OidcRegistry, RegistryOptions, SharedLimits};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use serde_json::{json, Value};
 use tokio::sync::{Notify, Semaphore};
@@ -104,22 +104,37 @@ fn jwks(kid: &str, secret: &str) -> Value {
     json!({"keys": [{"kty": "oct", "alg": "HS256", "kid": kid,
         "k": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret)}]})
 }
-fn token(issuer: &str, subject: &str, kid: &str, secret: &str) -> String {
-    let exp = SystemTime::now()
+fn now() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs()
-        + 600;
+}
+fn signed(claims: Value, kid: &str, secret: &str) -> String {
     let header = Header {
         kid: Some(kid.into()),
         ..Header::default()
     };
     encode(
         &header,
-        &json!({"iss":issuer,"sub":subject,"exp":exp}),
+        &claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )
     .unwrap()
+}
+fn token(issuer: &str, subject: &str, kid: &str, secret: &str) -> String {
+    signed(
+        json!({"iss":issuer,"sub":subject,"exp":now() + 600}),
+        kid,
+        secret,
+    )
+}
+fn token_issued_at(issuer: &str, iat: u64, kid: &str, secret: &str) -> String {
+    signed(
+        json!({"iss":issuer,"sub":"user","iat":iat,"exp":now() + 600}),
+        kid,
+        secret,
+    )
 }
 async fn advance(seconds: u64) {
     tokio::time::pause();
@@ -376,4 +391,152 @@ async fn invalid_identity_responses_are_unavailable_and_share_failure_backoff() 
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test]
+async fn a_key_published_after_the_fetch_is_retryable_rather_than_rejected() {
+    let keys = KeyServer::new().await;
+    let registry = OidcRegistry::from_config(&[keys.config("publish")]).unwrap();
+    assert!(registry
+        .try_validate(&token("publish", "user", "one", SECRET))
+        .await
+        .unwrap()
+        .is_ok());
+    // The issuer publishes and signs with a new key just after our fetch.
+    *keys.keys.write().unwrap() = jwks("two", "signing-secret-two");
+    let fresh = token_issued_at("publish", now(), "two", "signing-secret-two");
+    assert!(
+        matches!(
+            registry.try_validate(&fresh).await,
+            Some(Err(Error::Unavailable(_)))
+        ),
+        "inside the authoritative window a new token's key may not be fetched yet"
+    );
+    // A token issued well before the fetch had its key published already.
+    let stale = token_issued_at("publish", now() - 120, "two", "signing-secret-two");
+    assert!(matches!(
+        registry.try_validate(&stale).await,
+        Some(Err(Error::Auth(_)))
+    ));
+    assert_eq!(keys.calls.load(Ordering::SeqCst), 1);
+    advance(2).await;
+    assert!(registry.try_validate(&fresh).await.unwrap().is_ok());
+    assert_eq!(keys.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn registries_sharing_limits_share_refresh_capacity() {
+    let busy = KeyServer::new().await;
+    let other = KeyServer::new().await;
+    busy.mode.store(1, Ordering::SeqCst);
+    let limits = SharedLimits::new(1, 1).unwrap();
+    let options = || {
+        let mut options = RegistryOptions::default();
+        options.limits = limits.clone();
+        options
+    };
+    let first = Arc::new(OidcRegistry::with_options(&[busy.config("busy")], options()).unwrap());
+    let second = OidcRegistry::with_options(&[other.config("other")], options()).unwrap();
+    let pending = tokio::spawn({
+        let first = first.clone();
+        async move {
+            first
+                .try_validate(&token("busy", "user", "one", SECRET))
+                .await
+        }
+    });
+    busy.started.notified().await;
+    assert!(
+        matches!(
+            second
+                .try_validate(&token("other", "user", "one", SECRET))
+                .await,
+            Some(Err(Error::Unavailable(_)))
+        ),
+        "the only refresh slot belongs to the other registry"
+    );
+    busy.release.add_permits(1);
+    assert!(pending.await.unwrap().unwrap().is_ok());
+    assert!(second
+        .try_validate(&token("other", "user", "one", SECRET))
+        .await
+        .unwrap()
+        .is_ok());
+    assert_eq!(other.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_full_result_cache_never_rejects_valid_tokens() {
+    let keys = KeyServer::new().await;
+    let mut options = RegistryOptions::default();
+    options.result_cache_capacity = 1;
+    let registry = Arc::new(OidcRegistry::with_options(&[keys.config("full")], options).unwrap());
+    let checks: Vec<_> = (0..64)
+        .map(|i| {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                registry
+                    .try_validate(&token("full", &format!("user-{i}"), "one", SECRET))
+                    .await
+            })
+        })
+        .collect();
+    for check in checks {
+        assert!(check.await.unwrap().unwrap().is_ok());
+    }
+}
+
+#[test]
+fn inconsistent_options_are_rejected_at_construction() {
+    let issuers = [
+        IssuerConfig {
+            jwks_uri: Some("https://a.example/jwks".into()),
+            ..IssuerConfig::discovery("a")
+        },
+        IssuerConfig::discovery("https://b.example"),
+    ];
+    type Change = fn(&mut RegistryOptions);
+    let invalid: [(&str, Change); 7] = [
+        ("zero http timeout", |o| o.http_timeout = Duration::ZERO),
+        ("refresh deadline within the http timeout", |o| {
+            o.refresh_deadline = o.http_timeout
+        }),
+        ("zero validate deadline", |o| {
+            o.validate_deadline = Some(Duration::ZERO)
+        }),
+        ("keys shorter-lived than the authoritative window", |o| {
+            o.jwks_ttl = Duration::from_secs(1)
+        }),
+        ("cooldown outlasting the keys", |o| {
+            o.failure_cooldown = o.jwks_ttl
+        }),
+        ("fewer endpoint slots than configured endpoints", |o| {
+            o.endpoint_capacity = 1
+        }),
+        ("result reuse beyond a minute", |o| {
+            o.result_cache_ttl = Duration::from_secs(61)
+        }),
+    ];
+    for (case, change) in invalid {
+        let mut options = RegistryOptions::default();
+        change(&mut options);
+        assert!(
+            matches!(
+                OidcRegistry::with_options(&issuers, options),
+                Err(Error::Config(_))
+            ),
+            "{case}"
+        );
+    }
+    let mut custom = RegistryOptions::default();
+    custom.http_timeout = Duration::from_millis(500);
+    custom.refresh_deadline = Duration::from_secs(1);
+    custom.validate_deadline = None;
+    custom.failure_cooldown = Duration::ZERO;
+    custom.endpoint_capacity = 2;
+    custom.result_cache_capacity = 0;
+    custom.limits = SharedLimits::new(4, 8).unwrap();
+    assert!(OidcRegistry::with_options(&issuers, custom).is_ok());
+    assert!(matches!(SharedLimits::new(0, 1), Err(Error::Config(_))));
+    assert!(matches!(SharedLimits::new(2, 1), Err(Error::Config(_))));
 }

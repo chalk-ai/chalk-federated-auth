@@ -19,17 +19,28 @@
 //! federating with it only requires `IssuerConfig::discovery("https://api.chalk.ai")`
 //! (signing keys rotate; never pin them).
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use base64::Engine;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 mod endpoint_cache;
+mod options;
 mod verification;
-use endpoint_cache::EndpointCache;
-use verification::VerificationCache;
+use endpoint_cache::{EndpointCache, Policy};
+use options::AUTHORITATIVE_WINDOW;
+pub use options::{RegistryOptions, SharedLimits};
+use verification::ResultCache;
+
+/// A token newer than this, relative to the keyset fetch, may be signed with a
+/// key the issuer published after that fetch.
+const KEY_PUBLICATION_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Misconfiguration detected while building the registry.
     #[error("config error: {0}")]
@@ -138,10 +149,10 @@ pub struct OidcRegistry {
     jwks: EndpointCache<jsonwebtoken::jwk::JwkSet>,
     discovery: EndpointCache<String>,
     http: reqwest::Client,
-    verifications: Arc<VerificationCache>,
+    verifications: ResultCache,
+    jwks_ttl: Duration,
+    validate_deadline: Option<Duration>,
 }
-
-const JWKS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl OidcRegistry {
     /// Registry that trusts no issuers; `try_validate` always returns `None`.
@@ -149,7 +160,14 @@ impl OidcRegistry {
         Self::from_config(&[]).expect("empty registry cannot fail")
     }
 
+    /// Registry with [`RegistryOptions::default`].
     pub fn from_config(configs: &[IssuerConfig]) -> Result<Self> {
+        Self::with_options(configs, RegistryOptions::default())
+    }
+
+    /// Registry with explicit deadlines, cache sizes, and refresh budgets.
+    /// Inconsistent options are rejected with [`Error::Config`].
+    pub fn with_options(configs: &[IssuerConfig], options: RegistryOptions) -> Result<Self> {
         let mut issuers = HashMap::new();
         for c in configs {
             let key_source = if let Some(ref env_name) = c.secret_env {
@@ -200,15 +218,35 @@ impl OidcRegistry {
                 },
             );
         }
+        // Discovery issuers need one discovery entry and one JWKS entry each.
+        let endpoints: HashSet<&str> = issuers
+            .values()
+            .filter_map(|issuer| match &issuer.key_source {
+                KeySource::Secret(_) => None,
+                KeySource::Jwks { uri } => Some(uri.as_str()),
+                KeySource::Discovery { issuer_url } => Some(issuer_url.as_str()),
+            })
+            .collect();
+        options.validate(endpoints.len())?;
+        let policy = Policy {
+            capacity: options.endpoint_capacity,
+            deadline: options.refresh_deadline,
+            cooldown: options.failure_cooldown,
+        };
         Ok(Self {
             issuers,
-            verifications: VerificationCache::new(),
-            jwks: EndpointCache::new(),
-            discovery: EndpointCache::new(),
+            verifications: ResultCache::new(
+                options.result_cache_capacity,
+                options.result_cache_ttl,
+            ),
+            jwks: EndpointCache::new(options.limits.clone(), policy),
+            discovery: EndpointCache::new(options.limits, policy),
             http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(2))
+                .timeout(options.http_timeout)
                 .build()
                 .map_err(|e| Error::Config(e.to_string()))?,
+            jwks_ttl: options.jwks_ttl,
+            validate_deadline: options.validate_deadline,
         })
     }
 
@@ -225,14 +263,13 @@ impl OidcRegistry {
         }
         let iss = peek_issuer(token)?;
         let issuer = self.issuers.get(&iss)?;
-        Some(
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                self.validate_with_issuer(token, &iss, issuer),
-            )
-            .await
-            .unwrap_or_else(|_| Err(Error::Unavailable("token verification timed out".into()))),
-        )
+        let validation = self.validate_with_issuer(token, &iss, issuer);
+        Some(match self.validate_deadline {
+            Some(deadline) => tokio::time::timeout(deadline, validation)
+                .await
+                .unwrap_or_else(|_| Err(Error::Unavailable("token verification timed out".into()))),
+            None => validation.await,
+        })
     }
 
     async fn validate_with_issuer(
@@ -244,7 +281,7 @@ impl OidcRegistry {
         let header =
             decode_header(token).map_err(|e| Error::Auth(format!("invalid token header: {e}")))?;
 
-        let (key, revision) = self.resolve_key(issuer, &header).await?;
+        let (key, revision) = self.resolve_key(issuer, token, &header).await?;
 
         let mut validation = Validation::new(header.alg);
         validation.validate_exp = issuer.require_exp;
@@ -261,17 +298,16 @@ impl OidcRegistry {
         }
         validation.set_issuer(&[iss]);
 
-        let owned_token = token.to_owned();
-        let subject_claim = issuer.subject_claim.clone();
-        let scopes_claim = issuer.scopes_claim.clone();
+        let subject_claim = &issuer.subject_claim;
+        let scopes_claim = &issuer.scopes_claim;
         self.verifications
-            .verify(token, revision, issuer.require_exp, move || {
-                let token_data = decode::<serde_json::Value>(&owned_token, &key, &validation)
+            .verify(token, revision, issuer.require_exp, || {
+                let token_data = decode::<serde_json::Value>(token, &key, &validation)
                     .map_err(|e| Error::Auth(format!("federated token invalid: {e}")))?;
 
                 let sub = token_data
                     .claims
-                    .get(&subject_claim)
+                    .get(subject_claim)
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
                         Error::Auth(format!(
@@ -289,7 +325,7 @@ impl OidcRegistry {
 
                 let scopes = token_data
                     .claims
-                    .get(&scopes_claim)
+                    .get(scopes_claim)
                     .and_then(|v| v.as_array())
                     .map(|arr| {
                         arr.iter()
@@ -300,20 +336,20 @@ impl OidcRegistry {
 
                 Ok(Claims { sub, exp, scopes })
             })
-            .await
     }
 
     async fn resolve_key(
         &self,
         issuer: &ResolvedIssuer,
+        token: &str,
         header: &jsonwebtoken::Header,
     ) -> Result<(DecodingKey, u64)> {
         match &issuer.key_source {
             KeySource::Secret(secret) => Ok((DecodingKey::from_secret(secret.as_bytes()), 0)),
-            KeySource::Jwks { uri } => self.resolve_jwks_key(uri, header).await,
+            KeySource::Jwks { uri } => self.resolve_jwks_key(uri, token, header).await,
             KeySource::Discovery { issuer_url } => {
                 let jwks_uri = self.discover_jwks_uri(issuer_url).await?;
-                self.resolve_jwks_key(&jwks_uri, header).await
+                self.resolve_jwks_key(&jwks_uri, token, header).await
             }
         }
     }
@@ -321,11 +357,13 @@ impl OidcRegistry {
     async fn resolve_jwks_key(
         &self,
         jwks_uri: &str,
+        token: &str,
         header: &jsonwebtoken::Header,
     ) -> Result<(DecodingKey, u64)> {
         let kid = header.kid.as_deref();
         let http = self.http.clone();
         let uri = jwks_uri.to_owned();
+        let ttl = self.jwks_ttl;
         let cached = self
             .jwks
             .get(
@@ -333,14 +371,29 @@ impl OidcRegistry {
                 |cached| {
                     let age = cached.fetched_at.elapsed();
                     // A newly fetched set is authoritative even for absent kids.
-                    age < std::time::Duration::from_secs(1)
-                        || (age < JWKS_CACHE_TTL && find_jwk(&cached.value, kid).is_some())
+                    age < AUTHORITATIVE_WINDOW
+                        || (age < ttl && find_jwk(&cached.value, kid).is_some())
                 },
                 move || async move { fetch_json(&http, &uri).await },
             )
             .await?;
-        let key = find_jwk(&cached.value, kid)
-            .ok_or_else(|| Error::Auth("no matching JWK found".into()))?;
+        let Some(key) = find_jwk(&cached.value, kid) else {
+            // A token issued after (or shortly before) this fetch may use a key
+            // the issuer published since; retry once the keyset is refetched.
+            // `iat` is unverified, so a forger can only choose a 503 over a 401.
+            let fetched = SystemTime::now()
+                .checked_sub(cached.fetched_at.elapsed())
+                .unwrap_or(UNIX_EPOCH);
+            let issued = peek_claim(token, "iat")
+                .and_then(|iat| iat.as_u64())
+                .map(|iat| UNIX_EPOCH + Duration::from_secs(iat));
+            return Err(match issued {
+                Some(issued) if issued + KEY_PUBLICATION_GRACE > fetched => Error::Unavailable(
+                    format!("signing key (kid={kid:?}) is not yet published at {jwks_uri}"),
+                ),
+                _ => Error::Auth(format!("no matching JWK found (kid={kid:?}) at {jwks_uri}")),
+            });
+        };
         DecodingKey::from_jwk(key)
             .map(|key| (key, cached.revision))
             .map_err(|e| Error::Auth(format!("invalid JWK: {e}")))
@@ -359,12 +412,15 @@ impl OidcRegistry {
                 |_| true,
                 move || async move {
                     let doc: serde_json::Value = fetch_json(&http, &url).await?;
-                    doc.get("jwks_uri")
+                    let jwks_uri = doc
+                        .get("jwks_uri")
                         .and_then(|value| value.as_str())
                         .map(str::to_owned)
                         .ok_or_else(|| {
                             Error::Unavailable(format!("OIDC discovery at {url} has no jwks_uri"))
-                        })
+                        })?;
+                    tracing::info!(discovery_url = %url, %jwks_uri, "discovered JWKS endpoint");
+                    Ok(jwks_uri)
                 },
             )
             .await?;
@@ -393,13 +449,18 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(
 /// token to the right issuer before signature verification; never treat the
 /// result as authenticated.
 pub fn peek_issuer(token: &str) -> Option<String> {
+    peek_claim(token, "iss")?.as_str().map(String::from)
+}
+
+/// Read one claim from a JWT payload without validating it.
+fn peek_claim(token: &str, claim: &str) -> Option<serde_json::Value> {
     let payload_b64 = token.split('.').nth(1)?;
     let unpadded = payload_b64.trim_end_matches('=');
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(unpadded)
         .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value.get("iss")?.as_str().map(String::from)
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get_mut(claim).map(serde_json::Value::take)
 }
 
 fn find_jwk<'a>(

@@ -4,7 +4,7 @@ use std::{
     future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, LazyLock, Mutex,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -13,29 +13,18 @@ use futures_util::{
     future::{BoxFuture, Shared},
     FutureExt,
 };
-use tokio::{
-    sync::{OwnedSemaphorePermit, Semaphore},
-    time::Instant,
-};
+use tokio::{sync::OwnedSemaphorePermit, time::Instant};
 
-use crate::{Error, Result};
+use crate::{options::SharedLimits, Error, Result};
 
-const ENDPOINT_CAPACITY: usize = 1024;
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(3);
-const FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
 static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
-struct HttpBudget {
-    active: Semaphore,
-    attempts: Arc<Semaphore>,
+#[derive(Clone, Copy)]
+pub(super) struct Policy {
+    pub capacity: usize,
+    pub deadline: Duration,
+    pub cooldown: Duration,
 }
-static HTTP_BUDGET: LazyLock<Arc<HttpBudget>> = LazyLock::new(|| {
-    Arc::new(HttpBudget {
-        active: Semaphore::new(16),
-        // Includes active and queued endpoint owners, independently of followers.
-        attempts: Arc::new(Semaphore::new(256)),
-    })
-});
 
 pub(super) struct Cached<T> {
     pub value: T,
@@ -55,13 +44,15 @@ struct Cell<T> {
 
 pub(super) struct EndpointCache<T> {
     cells: Mutex<HashMap<String, Arc<Cell<T>>>>,
-    budget: Arc<HttpBudget>,
+    limits: SharedLimits,
+    policy: Policy,
 }
-impl<T: Send + Sync + 'static> EndpointCache<T> {
-    pub fn new() -> Self {
+impl<T: PartialEq + Send + Sync + 'static> EndpointCache<T> {
+    pub fn new(limits: SharedLimits, policy: Policy) -> Self {
         Self {
             cells: Mutex::new(HashMap::new()),
-            budget: HTTP_BUDGET.clone(),
+            limits,
+            policy,
         }
     }
 
@@ -77,7 +68,7 @@ impl<T: Send + Sync + 'static> EndpointCache<T> {
     {
         let cell = {
             let mut cells = self.cells.lock().unwrap();
-            if !cells.contains_key(endpoint) && cells.len() >= ENDPOINT_CAPACITY {
+            if !cells.contains_key(endpoint) && cells.len() >= self.policy.capacity {
                 return Err(Error::Unavailable("too many identity endpoints".into()));
             }
             cells
@@ -108,10 +99,16 @@ impl<T: Send + Sync + 'static> EndpointCache<T> {
             if let Some(attempt) = &state.inflight {
                 attempt.clone()
             } else {
-                let lease = self.budget.attempts.clone().try_acquire_owned();
+                let lease = self.limits.inner.refreshes.clone().try_acquire_owned();
                 let lease = lease
                     .map_err(|_| Error::Unavailable("identity refresh capacity is busy".into()))?;
-                let attempt = cell.start(endpoint.to_owned(), self.budget.clone(), lease, fetch);
+                let attempt = cell.start(
+                    endpoint.to_owned(),
+                    self.limits.clone(),
+                    self.policy,
+                    lease,
+                    fetch,
+                );
                 state.inflight = Some(attempt.clone());
                 attempt
             }
@@ -120,11 +117,12 @@ impl<T: Send + Sync + 'static> EndpointCache<T> {
     }
 }
 
-impl<T: Send + Sync + 'static> Cell<T> {
+impl<T: PartialEq + Send + Sync + 'static> Cell<T> {
     fn start<F, Fut>(
         self: &Arc<Self>,
         endpoint: String,
-        budget: Arc<HttpBudget>,
+        limits: SharedLimits,
+        policy: Policy,
         lease: OwnedSemaphorePermit,
         fetch: F,
     ) -> Attempt<T>
@@ -141,9 +139,10 @@ impl<T: Send + Sync + 'static> Cell<T> {
             // Queue-only timeouts are local pressure. Once admitted, even a
             // total timeout interrupted during HTTP earns endpoint backoff.
             let result =
-                std::panic::AssertUnwindSafe(tokio::time::timeout(REFRESH_TIMEOUT, async {
-                    let _http = budget
-                        .active
+                std::panic::AssertUnwindSafe(tokio::time::timeout(policy.deadline, async {
+                    let _http = limits
+                        .inner
+                        .http
                         .acquire()
                         .await
                         .expect("HTTP budget stays open");
@@ -166,22 +165,29 @@ impl<T: Send + Sync + 'static> Cell<T> {
                     true,
                 ),
             };
-            let result = result.map(|value| {
-                Arc::new(Cached {
+            let mut state = cell.state.lock().unwrap();
+            state.inflight = None;
+            let result = result.map(|value| match state.value.take() {
+                // An unchanged response keeps its revision, so refreshes forced
+                // by unknown key IDs do not invalidate reused signature checks.
+                Some(previous) if previous.value == value => Arc::new(Cached {
+                    value,
+                    fetched_at: Instant::now(),
+                    revision: previous.revision,
+                }),
+                _ => Arc::new(Cached {
                     value,
                     fetched_at: Instant::now(),
                     revision: NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
-                })
+                }),
             });
-            let mut state = cell.state.lock().unwrap();
-            state.inflight = None;
             match &result {
                 Ok(value) => {
                     state.value = Some(value.clone());
                     state.failure = None;
                 }
-                Err(error) if backoff => {
-                    state.failure = Some((Instant::now() + FAILURE_COOLDOWN, error.clone()));
+                Err(error) if backoff && !policy.cooldown.is_zero() => {
+                    state.failure = Some((Instant::now() + policy.cooldown, error.clone()));
                 }
                 Err(_) => {}
             }
@@ -219,14 +225,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn cache(active: usize, attempts: usize) -> Arc<EndpointCache<usize>> {
-        Arc::new(EndpointCache {
-            cells: Mutex::new(HashMap::new()),
-            budget: Arc::new(HttpBudget {
-                active: Semaphore::new(active),
-                attempts: Arc::new(Semaphore::new(attempts)),
-            }),
-        })
+    const REFRESH_TIMEOUT: Duration = Duration::from_secs(3);
+    const FAILURE_COOLDOWN: Duration = Duration::from_secs(1);
+
+    fn cache(http: usize, refreshes: usize) -> Arc<EndpointCache<usize>> {
+        Arc::new(EndpointCache::new(
+            SharedLimits::unchecked(http, refreshes),
+            Policy {
+                capacity: 1024,
+                deadline: REFRESH_TIMEOUT,
+                cooldown: FAILURE_COOLDOWN,
+            },
+        ))
     }
 
     #[tokio::test(start_paused = true)]
@@ -239,7 +249,7 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(REFRESH_TIMEOUT).await;
         assert!(request.await.unwrap().is_err());
-        cache.budget.active.add_permits(1);
+        cache.limits.inner.http.add_permits(1);
         assert_eq!(
             cache
                 .get("healthy", |_| true, || async { Ok(7) })
@@ -271,7 +281,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_millis(1500)).await;
-        cache.budget.active.add_permits(1);
+        cache.limits.inner.http.add_permits(1);
         started.notified().await;
         tokio::time::advance(Duration::from_millis(1500)).await;
         assert!(request.await.unwrap().is_err());
@@ -318,7 +328,7 @@ mod tests {
                     .await
             }
         });
-        while cache.budget.attempts.available_permits() != 0 {
+        while cache.limits.inner.refreshes.available_permits() != 0 {
             tokio::task::yield_now().await;
         }
         first.abort();
@@ -339,12 +349,12 @@ mod tests {
                 })
             })
             .collect();
-        cache.budget.active.add_permits(1);
+        cache.limits.inner.http.add_permits(1);
         for follower in followers {
             assert_eq!(follower.await.unwrap().unwrap().value, 7);
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert_eq!(cache.budget.attempts.available_permits(), 1);
+        assert_eq!(cache.limits.inner.refreshes.available_permits(), 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -381,7 +391,64 @@ mod tests {
                     .value,
                 7
             );
-            assert_eq!(cache.budget.attempts.available_permits(), 1);
+            assert_eq!(cache.limits.inner.refreshes.available_permits(), 1);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unchanged_responses_keep_their_revision() {
+        let cache = cache(1, 1);
+        let fetch = |value: usize| move || async move { Ok(value) };
+        let first = cache.get("keys", |_| false, fetch(7)).await.unwrap();
+        let same = cache.get("keys", |_| false, fetch(7)).await.unwrap();
+        assert_eq!(same.revision, first.revision);
+        assert!(same.fetched_at >= first.fetched_at);
+        let changed = cache.get("keys", |_| false, fetch(8)).await.unwrap();
+        assert_ne!(changed.revision, first.revision);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_cooldown_retries_the_next_request() {
+        let cache = Arc::new(EndpointCache::new(
+            SharedLimits::unchecked(1, 1),
+            Policy {
+                capacity: 1024,
+                deadline: REFRESH_TIMEOUT,
+                cooldown: Duration::ZERO,
+            },
+        ));
+        assert!(cache
+            .get(
+                "flaky",
+                |_| true,
+                || async { Err(Error::Unavailable("offline".into())) }
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            cache
+                .get("flaky", |_| true, || async { Ok(7) })
+                .await
+                .unwrap()
+                .value,
+            7
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_capacity_is_enforced() {
+        let cache = Arc::new(EndpointCache::new(
+            SharedLimits::unchecked(1, 1),
+            Policy {
+                capacity: 1,
+                deadline: REFRESH_TIMEOUT,
+                cooldown: FAILURE_COOLDOWN,
+            },
+        ));
+        assert!(cache.get("a", |_| true, || async { Ok(1) }).await.is_ok());
+        assert!(matches!(
+            cache.get("b", |_| true, || async { Ok(2) }).await,
+            Err(Error::Unavailable(_))
+        ));
     }
 }

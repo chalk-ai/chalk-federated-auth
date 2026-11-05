@@ -1,136 +1,105 @@
-//! Signature work starts only after key resolution and never runs on async workers.
+//! Short-lived reuse of successful signature checks.
+//!
+//! Callers resolve signing keys first, so a reused result never outlives a
+//! keyset change: entries are keyed by token digest and keyset revision.
+//! Checks run inline. An RS256 verification costs tens of microseconds, less
+//! than handing it to the blocking pool, so there is no admission or queue.
 use std::{
     collections::HashMap,
-    sync::{Arc, LazyLock, Mutex},
+    sync::Mutex,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use futures_util::{
-    future::{BoxFuture, Shared},
-    FutureExt,
-};
 use sha2::{Digest, Sha256};
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::time::Instant;
 
-use crate::{Claims, Error, Result};
-
-const CAPACITY: usize = 4096;
-const RESULT_TTL: Duration = Duration::from_secs(1);
-const TIMEOUT: Duration = Duration::from_secs(3);
-static CPU_BUDGET: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
-    Arc::new(Semaphore::new(
-        std::thread::available_parallelism()
-            .map_or(2, usize::from)
-            .clamp(1, 16),
-    ))
-});
+use crate::{Claims, Result};
 
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 struct Key {
     token: [u8; 32],
     revision: u64,
 }
-type Attempt = Shared<BoxFuture<'static, Result<Claims>>>;
-enum Entry {
-    Running(Attempt),
-    Ready { claims: Claims, until: Instant },
+
+struct Entries {
+    map: HashMap<Key, (Claims, Instant)>,
+    next_sweep: Instant,
 }
 
-pub(super) struct VerificationCache {
-    entries: Mutex<HashMap<Key, Entry>>,
-    budget: Arc<Semaphore>,
+pub(crate) struct ResultCache {
+    entries: Mutex<Entries>,
+    capacity: usize,
+    ttl: Duration,
 }
-impl VerificationCache {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            entries: Mutex::new(HashMap::new()),
-            budget: CPU_BUDGET.clone(),
-        })
+
+impl ResultCache {
+    pub fn new(capacity: usize, ttl: Duration) -> Self {
+        Self {
+            entries: Mutex::new(Entries {
+                map: HashMap::new(),
+                next_sweep: Instant::now(),
+            }),
+            capacity,
+            ttl,
+        }
     }
 
-    pub async fn verify(
-        self: &Arc<Self>,
+    /// Return a reusable success for `token` under `revision`, or run `check`.
+    /// Failures are never cached, and a full cache only skips caching.
+    pub fn verify(
+        &self,
         token: &str,
         revision: u64,
         require_exp: bool,
-        check: impl FnOnce() -> Result<Claims> + Send + 'static,
+        check: impl FnOnce() -> Result<Claims>,
     ) -> Result<Claims> {
+        if self.capacity == 0 || self.ttl.is_zero() {
+            return check();
+        }
         let key = Key {
             token: Sha256::digest(token).into(),
             revision,
         };
-        let attempt = {
-            let mut entries = self.entries.lock().unwrap();
-            if let Some(Entry::Ready { claims, until }) = entries.get(&key) {
-                if Instant::now() < *until && cacheable(claims, require_exp) {
-                    return Ok(claims.clone());
-                }
-            }
-            if let Some(Entry::Running(attempt)) = entries.get(&key) {
-                attempt.clone()
-            } else {
-                // Discard completed entries before rejecting new work. Followers
-                // always join an admitted token, even when bookkeeping is full.
-                entries.remove(&key);
-                if entries.len() >= CAPACITY {
-                    entries.retain(|_, entry| matches!(entry, Entry::Running(_)));
-                }
-                if entries.len() >= CAPACITY {
-                    return Err(Error::Unavailable("signature verification is busy".into()));
-                }
-                let cache = self.clone();
-                let attempt = async move {
-                    let result = tokio::time::timeout(TIMEOUT, async {
-                        let permit = cache.budget.clone().acquire_owned().await.map_err(|_| {
-                            Error::Unavailable("signature verification is unavailable".into())
-                        })?;
-                        // A timed-out/aborted waiter cannot release the CPU permit
-                        // while its blocking job is still running.
-                        tokio::task::spawn_blocking(move || {
-                            let _permit = permit;
-                            check()
-                        })
-                        .await
-                        .map_err(|_| {
-                            Error::Unavailable("signature verification failed internally".into())
-                        })?
-                    })
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(Error::Unavailable(
-                            "signature verification timed out".into(),
-                        ))
-                    });
-                    let mut entries = cache.entries.lock().unwrap();
-                    entries.remove(&key);
-                    if let Ok(claims) = &result {
-                        if cacheable(claims, require_exp) {
-                            entries.insert(
-                                key,
-                                Entry::Ready {
-                                    claims: claims.clone(),
-                                    until: Instant::now() + RESULT_TTL,
-                                },
-                            );
-                        }
-                    }
-                    result
-                }
-                .boxed()
-                .shared();
-                entries.insert(key, Entry::Running(attempt.clone()));
-                let driver = attempt.clone();
-                tokio::spawn(async move {
-                    let _ = driver.await;
-                });
-                attempt
-            }
-        };
-        attempt.await
+        if let Some(claims) = self.lookup(&key, require_exp) {
+            return Ok(claims);
+        }
+        let claims = check()?;
+        if unexpired(&claims, require_exp) {
+            self.insert(key, claims.clone());
+        }
+        Ok(claims)
+    }
+
+    fn lookup(&self, key: &Key, require_exp: bool) -> Option<Claims> {
+        let mut entries = self.entries.lock().unwrap();
+        let (claims, until) = entries.map.get(key)?;
+        if Instant::now() < *until && unexpired(claims, require_exp) {
+            return Some(claims.clone());
+        }
+        entries.map.remove(key);
+        None
+    }
+
+    fn insert(&self, key: Key, claims: Claims) {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap();
+        // Sweep at most once per TTL, so a full cache is not rescanned per request.
+        if now >= entries.next_sweep {
+            entries.map.retain(|_, (_, until)| now < *until);
+            entries.next_sweep = now + self.ttl;
+        }
+        if entries.map.len() < self.capacity || entries.map.contains_key(&key) {
+            entries.map.insert(key, (claims, now + self.ttl));
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().map.len()
     }
 }
 
-fn cacheable(claims: &Claims, require_exp: bool) -> bool {
+fn unexpired(claims: &Claims, require_exp: bool) -> bool {
     !require_exp
         || (claims.exp as u64)
             > SystemTime::now()
@@ -142,17 +111,11 @@ fn cacheable(claims: &Claims, require_exp: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc,
-    };
+    use crate::Error;
+    use std::cell::Cell;
 
-    fn cache(slots: usize) -> Arc<VerificationCache> {
-        Arc::new(VerificationCache {
-            entries: Mutex::new(HashMap::new()),
-            budget: Arc::new(Semaphore::new(slots)),
-        })
-    }
+    const TTL: Duration = Duration::from_secs(1);
+
     fn claims() -> Claims {
         Claims {
             sub: "user".into(),
@@ -161,119 +124,75 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn identical_bursts_share_one_blocking_check_and_survive_cancellation() {
-        let cache = cache(2);
-        let started = Arc::new(tokio::sync::Notify::new());
-        let calls = Arc::new(AtomicUsize::new(0));
-        let (release, wait) = mpsc::channel();
-        let first = tokio::spawn({
-            let (cache, started, calls) = (cache.clone(), started.clone(), calls.clone());
-            async move {
-                cache
-                    .verify("same", 1, true, move || {
-                        calls.fetch_add(1, Ordering::SeqCst);
-                        started.notify_one();
-                        wait.recv_timeout(Duration::from_secs(5)).unwrap();
-                        Ok(claims())
-                    })
-                    .await
-            }
-        });
-        started.notified().await;
-        first.abort();
-        let _ = first.await;
-        let followers: Vec<_> = (0..512)
-            .map(|_| {
-                let cache = cache.clone();
-                tokio::spawn(
-                    async move { cache.verify("same", 1, true, || panic!("must share")).await },
-                )
-            })
-            .collect();
-        // A current-thread runtime remains responsive while the first check is
-        // blocked, and an unrelated token can use the other CPU slot.
-        assert!(cache
-            .verify("other", 1, true, || Ok(claims()))
-            .await
-            .is_ok());
-        release.send(()).unwrap();
-        for follower in followers {
-            assert!(follower.await.unwrap().is_ok());
-        }
-        assert!(cache
-            .verify("same", 1, true, || panic!("must reuse result"))
-            .await
-            .is_ok());
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
-        assert!(cache
-            .verify("same", 2, true, || Err(Error::Auth("new keys".into())))
-            .await
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn expired_claims_failures_and_panics_are_not_memoized() {
-        let cache = cache(1);
-        let expired = Claims { exp: 1, ..claims() };
+    /// Runs `verify` and reports whether the check ran.
+    fn checked(cache: &ResultCache, token: &str, revision: u64) -> bool {
+        let ran = Cell::new(false);
         cache
-            .verify("expired", 1, true, || Ok(expired))
-            .await
+            .verify(token, revision, true, || {
+                ran.set(true);
+                Ok(claims())
+            })
             .unwrap();
-        assert!(cache
-            .verify("expired", 1, true, || Err(Error::Auth("expired".into())))
-            .await
-            .is_err());
-        for error in [
-            Error::Auth("bad signature".into()),
-            Error::Unavailable("busy".into()),
-        ] {
-            assert!(cache.verify("error", 1, true, || Err(error)).await.is_err());
-            assert!(cache
-                .verify("error", 1, true, || Ok(claims()))
-                .await
-                .is_ok());
-            cache.entries.lock().unwrap().clear();
-        }
-        assert!(matches!(
-            cache
-                .verify("panic", 1, true, || panic!("check panic"))
-                .await,
-            Err(Error::Unavailable(_))
-        ));
-        assert!(cache
-            .verify("panic", 1, true, || Ok(claims()))
-            .await
-            .is_ok());
+        ran.get()
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timing_out_a_blocking_check_keeps_its_cpu_permit_until_it_exits() {
-        let cache = cache(1);
-        let started = Arc::new(tokio::sync::Notify::new());
-        let (release, wait) = mpsc::channel();
-        let first = tokio::spawn({
-            let (cache, started) = (cache.clone(), started.clone());
-            async move {
-                cache
-                    .verify("first", 1, true, move || {
-                        started.notify_one();
-                        wait.recv_timeout(Duration::from_secs(5)).unwrap();
-                        Ok(claims())
-                    })
-                    .await
-            }
-        });
-        started.notified().await;
-        tokio::time::advance(TIMEOUT).await;
-        assert!(matches!(first.await.unwrap(), Err(Error::Unavailable(_))));
-        assert_eq!(cache.budget.available_permits(), 0);
-        release.send(()).unwrap();
-        // No endpoint/token cooldown was recorded for the deadline.
-        tokio::time::resume();
+    async fn successes_are_reused_until_the_ttl_or_a_revision_change() {
+        let cache = ResultCache::new(8, TTL);
+        assert!(checked(&cache, "a", 1));
+        assert!(!checked(&cache, "a", 1));
+        assert!(checked(&cache, "a", 2), "a new keyset revision re-verifies");
+        tokio::time::advance(TTL).await;
+        assert!(checked(&cache, "a", 1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failures_and_expired_claims_are_not_cached() {
+        let cache = ResultCache::new(8, TTL);
         assert!(cache
-            .verify("first", 1, true, || Ok(claims()))
-            .await
-            .is_ok());
+            .verify("bad", 1, true, || Err(Error::Auth("bad signature".into())))
+            .is_err());
+        assert!(checked(&cache, "bad", 1));
+        let expired = Claims { exp: 1, ..claims() };
+        cache.verify("old", 1, true, || Ok(expired)).unwrap();
+        assert!(checked(&cache, "old", 1));
+        // Without required expiry, `exp` is not consulted.
+        let ran = Cell::new(0);
+        for _ in 0..2 {
+            let expired = Claims { exp: 1, ..claims() };
+            cache
+                .verify("no-exp", 1, false, || {
+                    ran.set(ran.get() + 1);
+                    Ok(expired)
+                })
+                .unwrap();
+        }
+        assert_eq!(ran.get(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_cache_skips_caching_and_never_rejects() {
+        let cache = ResultCache::new(2, TTL);
+        assert!(checked(&cache, "a", 1));
+        assert!(checked(&cache, "b", 1));
+        assert!(checked(&cache, "c", 1));
+        assert!(checked(&cache, "c", 1), "c was not cached");
+        assert!(!checked(&cache, "a", 1), "existing entries survive");
+        assert_eq!(cache.len(), 2);
+        tokio::time::advance(TTL).await;
+        assert!(checked(&cache, "c", 1));
+        assert!(!checked(&cache, "c", 1), "expired entries were swept");
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn zero_capacity_or_ttl_disables_reuse() {
+        for cache in [
+            ResultCache::new(0, TTL),
+            ResultCache::new(8, Duration::ZERO),
+        ] {
+            assert!(checked(&cache, "a", 1));
+            assert!(checked(&cache, "a", 1));
+        }
     }
 }
