@@ -4,7 +4,7 @@ use std::{
     future::Future,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     time::Duration,
 };
@@ -95,7 +95,7 @@ impl<T: PartialEq + Send + Sync + 'static> EndpointCache<T> {
                 let lease = lease
                     .map_err(|_| Error::Unavailable("identity refresh capacity is busy".into()))?;
                 let attempt = start(
-                    cell.clone(),
+                    Arc::downgrade(&cell),
                     endpoint.to_owned(),
                     self.limits.clone(),
                     self.policy,
@@ -110,8 +110,11 @@ impl<T: PartialEq + Send + Sync + 'static> EndpointCache<T> {
     }
 }
 
+/// The attempt holds its cell weakly: the cell stores the attempt, so a strong
+/// reference would leak both, and the permits the attempt holds, once the
+/// spawned driver is dropped with its runtime.
 fn start<T, F, Fut>(
-    cell: Cell<T>,
+    cell: Weak<Mutex<State<T>>>,
     endpoint: String,
     limits: SharedLimits,
     policy: Policy,
@@ -156,11 +159,22 @@ where
                 true,
             ),
         };
-        let mut state = cell.lock().unwrap();
-        state.inflight = None;
         // Age keysets from the request start, which the response is at
         // least as fresh as; HTTP latency then never extends the window.
         let fetched_at = started.unwrap_or_else(Instant::now);
+        let Some(cell) = cell.upgrade() else {
+            // The cache is gone, so there is nothing to record; the permits
+            // drop with this future.
+            return result.map(|value| {
+                Arc::new(Cached {
+                    value,
+                    fetched_at,
+                    revision: NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
+                })
+            });
+        };
+        let mut state = cell.lock().unwrap();
+        state.inflight = None;
         let result = result.map(|value| match state.value.take() {
             // An unchanged response keeps its revision, so refreshes forced
             // by unknown key IDs do not invalidate reused signature checks.
@@ -424,5 +438,67 @@ mod tests {
                 .value,
             7
         );
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    /// (HTTP, refresh) permits available.
+    fn available(limits: &SharedLimits) -> (usize, usize) {
+        (
+            limits.inner.http.available_permits(),
+            limits.inner.refreshes.available_permits(),
+        )
+    }
+
+    /// Starts a refresh that holds both permits and never finishes, then
+    /// abandons the caller so only the detached attempt remains.
+    fn start_hung_refresh(
+        runtime: &tokio::runtime::Runtime,
+        limits: &SharedLimits,
+    ) -> Arc<EndpointCache<usize>> {
+        let _context = runtime.enter();
+        let cache = Arc::new(EndpointCache::new(
+            limits.clone(),
+            Policy {
+                deadline: REFRESH_TIMEOUT,
+                cooldown: FAILURE_COOLDOWN,
+            },
+        ));
+        let caller = cache
+            .get("hung", |_| true, std::future::pending)
+            .now_or_never();
+        assert!(caller.is_none());
+        assert_eq!(available(limits), (0, 0));
+        cache
+    }
+
+    #[test]
+    fn dropping_the_cache_then_the_runtime_releases_permits() {
+        let limits = SharedLimits::new(1, 1).unwrap();
+        let runtime = runtime();
+        let cache = start_hung_refresh(&runtime, &limits);
+        drop(cache);
+        assert_eq!(available(&limits), (0, 0), "the attempt still runs");
+        drop(runtime);
+        assert_eq!(available(&limits), (1, 1));
+    }
+
+    #[test]
+    fn a_cache_outliving_its_runtime_recovers_its_permits() {
+        let limits = SharedLimits::new(1, 1).unwrap();
+        let cache = start_hung_refresh(&runtime(), &limits);
+        assert_eq!(available(&limits), (0, 0), "nothing polls the attempt");
+        // The next caller polls the orphaned attempt; its timer belongs to the
+        // dead runtime, and the resulting panic ends the attempt as a failure.
+        let joined = runtime().block_on(cache.get("hung", |_| true, || async { Ok(7) }));
+        assert!(matches!(joined, Err(Error::Unavailable(_))));
+        assert_eq!(available(&limits), (1, 1));
+        drop(cache);
+        assert_eq!(available(&limits), (1, 1));
     }
 }
