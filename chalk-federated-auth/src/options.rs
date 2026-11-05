@@ -122,8 +122,6 @@ pub struct RegistryOptions {
     /// How long fetched signing keys are used before a refresh is required.
     /// At most 24 hours.
     pub jwks_ttl: Duration,
-    /// Distinct discovery or JWKS endpoints each registry tracks.
-    pub endpoint_capacity: usize,
     /// Successful signature checks kept for reuse. Zero disables reuse.
     /// When full, new results are not cached; requests are never rejected.
     pub result_cache_capacity: usize,
@@ -141,7 +139,6 @@ impl Default for RegistryOptions {
             validate_deadline: Some(Duration::from_secs(3)),
             failure_cooldown: Duration::from_secs(1),
             jwks_ttl: Duration::from_secs(300),
-            endpoint_capacity: 1024,
             result_cache_capacity: 4096,
             result_cache_ttl: Duration::from_secs(1),
             limits: SharedLimits::global(),
@@ -150,7 +147,7 @@ impl Default for RegistryOptions {
 }
 
 impl RegistryOptions {
-    pub(crate) fn validate(&self, configured_endpoints: usize) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let fail = |message: String| Err(Error::Config(message));
         if self.http_timeout.is_zero() {
             return fail("http_timeout must be positive".into());
@@ -180,12 +177,6 @@ impl RegistryOptions {
             return fail(format!(
                 "failure_cooldown ({:?}) must be less than jwks_ttl ({:?})",
                 self.failure_cooldown, self.jwks_ttl
-            ));
-        }
-        if self.endpoint_capacity < configured_endpoints {
-            return fail(format!(
-                "endpoint_capacity ({}) is below the {configured_endpoints} configured endpoints",
-                self.endpoint_capacity
             ));
         }
         if self.result_cache_ttl > MAX_RESULT_CACHE_TTL {

@@ -19,10 +19,7 @@
 //! federating with it only requires `IssuerConfig::discovery("https://api.chalk.ai")`
 //! (signing keys rotate; never pin them).
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use base64::Engine;
 use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
@@ -214,18 +211,8 @@ impl OidcRegistry {
                 },
             );
         }
-        // Discovery issuers need one discovery entry and one JWKS entry each.
-        let endpoints: HashSet<&str> = issuers
-            .values()
-            .filter_map(|issuer| match &issuer.key_source {
-                KeySource::Secret(_) => None,
-                KeySource::Jwks { uri } => Some(uri.as_str()),
-                KeySource::Discovery { issuer_url } => Some(issuer_url.as_str()),
-            })
-            .collect();
-        options.validate(endpoints.len())?;
+        options.validate()?;
         let policy = Policy {
-            capacity: options.endpoint_capacity,
             deadline: options.refresh_deadline,
             cooldown: options.failure_cooldown,
         };
@@ -279,25 +266,25 @@ impl OidcRegistry {
 
         let (key, revision) = self.resolve_key(issuer, &header).await?;
 
-        let mut validation = Validation::new(header.alg);
-        validation.validate_exp = issuer.require_exp;
-        if !issuer.require_exp {
-            // jsonwebtoken's default `required_spec_claims` demands that `exp`
-            // be *present* even when expiry checking is off; drop it so
-            // `require_exp = false` genuinely permits tokens without one.
-            validation.required_spec_claims.remove("exp");
-        }
-        if let Some(ref aud) = issuer.audience {
-            validation.set_audience(&[aud]);
-        } else {
-            validation.validate_aud = false;
-        }
-        validation.set_issuer(&[iss]);
-
         let subject_claim = &issuer.subject_claim;
         let scopes_claim = &issuer.scopes_claim;
         self.verifications
             .verify(token, revision, issuer.require_exp, || {
+                let mut validation = Validation::new(header.alg);
+                validation.validate_exp = issuer.require_exp;
+                if !issuer.require_exp {
+                    // jsonwebtoken's default `required_spec_claims` demands that `exp`
+                    // be *present* even when expiry checking is off; drop it so
+                    // `require_exp = false` genuinely permits tokens without one.
+                    validation.required_spec_claims.remove("exp");
+                }
+                if let Some(ref aud) = issuer.audience {
+                    validation.set_audience(&[aud]);
+                } else {
+                    validation.validate_aud = false;
+                }
+                validation.set_issuer(&[iss]);
+
                 let token_data = decode::<serde_json::Value>(token, &key, &validation)
                     .map_err(|e| Error::Auth(format!("federated token invalid: {e}")))?;
 

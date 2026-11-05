@@ -493,7 +493,7 @@ fn inconsistent_options_are_rejected_at_construction() {
         IssuerConfig::discovery("https://b.example"),
     ];
     type Change = fn(&mut RegistryOptions);
-    let invalid: [(&str, Change); 8] = [
+    let invalid: [(&str, Change); 7] = [
         ("zero http timeout", |o| o.http_timeout = Duration::ZERO),
         ("refresh deadline within the http timeout", |o| {
             o.refresh_deadline = o.http_timeout
@@ -509,9 +509,6 @@ fn inconsistent_options_are_rejected_at_construction() {
         }),
         ("cooldown outlasting the keys", |o| {
             o.failure_cooldown = o.jwks_ttl
-        }),
-        ("fewer endpoint slots than configured endpoints", |o| {
-            o.endpoint_capacity = 1
         }),
         ("result reuse beyond a minute", |o| {
             o.result_cache_ttl = Duration::from_secs(61)
@@ -533,7 +530,6 @@ fn inconsistent_options_are_rejected_at_construction() {
     custom.refresh_deadline = Duration::from_secs(1);
     custom.validate_deadline = None;
     custom.failure_cooldown = Duration::ZERO;
-    custom.endpoint_capacity = 2;
     custom.result_cache_capacity = 0;
     custom.limits = SharedLimits::new(4, 8).unwrap();
     assert!(OidcRegistry::with_options(&issuers, custom).is_ok());

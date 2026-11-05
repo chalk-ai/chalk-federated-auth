@@ -119,7 +119,6 @@ let registry = OidcRegistry::with_options(&issuers, options)?;
 | `validate_deadline` | `Some(3s)` | positive; `None` leaves it to the caller |
 | `failure_cooldown` | 1s | less than `jwks_ttl`; zero disables backoff |
 | `jwks_ttl` | 300s | greater than the 1s unknown-kid cooldown; at most 24h |
-| `endpoint_capacity` | 1,024 | at least the configured JWKS/discovery endpoints |
 | `result_cache_capacity` | 4,096 | zero disables result reuse |
 | `result_cache_ttl` | 1s | at most 60s; zero disables result reuse |
 | `limits` | `SharedLimits::global()` | `SharedLimits::new(http_calls, refresh_owners)` requires `1 <= http_calls <= refresh_owners` |

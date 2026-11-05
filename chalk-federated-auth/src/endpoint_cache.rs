@@ -21,7 +21,6 @@ static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 pub(super) struct Policy {
-    pub capacity: usize,
     pub deadline: Duration,
     pub cooldown: Duration,
 }
@@ -38,12 +37,10 @@ struct State<T> {
     inflight: Option<Attempt<T>>,
     failure: Option<(Instant, Error)>,
 }
-struct Cell<T> {
-    state: Mutex<State<T>>,
-}
+type Cell<T> = Arc<Mutex<State<T>>>;
 
 pub(super) struct EndpointCache<T> {
-    cells: Mutex<HashMap<String, Arc<Cell<T>>>>,
+    cells: Mutex<HashMap<String, Cell<T>>>,
     limits: SharedLimits,
     policy: Policy,
 }
@@ -68,24 +65,19 @@ impl<T: PartialEq + Send + Sync + 'static> EndpointCache<T> {
     {
         let cell = {
             let mut cells = self.cells.lock().unwrap();
-            if !cells.contains_key(endpoint) && cells.len() >= self.policy.capacity {
-                return Err(Error::Unavailable("too many identity endpoints".into()));
-            }
             cells
                 .entry(endpoint.to_owned())
                 .or_insert_with(|| {
-                    Arc::new(Cell {
-                        state: Mutex::new(State {
-                            value: None,
-                            inflight: None,
-                            failure: None,
-                        }),
-                    })
+                    Arc::new(Mutex::new(State {
+                        value: None,
+                        inflight: None,
+                        failure: None,
+                    }))
                 })
                 .clone()
         };
         let attempt = {
-            let mut state = cell.state.lock().unwrap();
+            let mut state = cell.lock().unwrap();
             if let Some(value) = &state.value {
                 if reusable(value) {
                     return Ok(value.clone());
@@ -102,7 +94,8 @@ impl<T: PartialEq + Send + Sync + 'static> EndpointCache<T> {
                 let lease = self.limits.inner.refreshes.clone().try_acquire_owned();
                 let lease = lease
                     .map_err(|_| Error::Unavailable("identity refresh capacity is busy".into()))?;
-                let attempt = cell.start(
+                let attempt = start(
+                    cell.clone(),
                     endpoint.to_owned(),
                     self.limits.clone(),
                     self.policy,
@@ -117,107 +110,107 @@ impl<T: PartialEq + Send + Sync + 'static> EndpointCache<T> {
     }
 }
 
-impl<T: PartialEq + Send + Sync + 'static> Cell<T> {
-    fn start<F, Fut>(
-        self: &Arc<Self>,
-        endpoint: String,
-        limits: SharedLimits,
-        policy: Policy,
-        lease: OwnedSemaphorePermit,
-        fetch: F,
-    ) -> Attempt<T>
-    where
-        F: FnOnce() -> Fut + Send + 'static,
-        Fut: Future<Output = Result<T>> + Send + 'static,
-    {
-        let cell = self.clone();
-        let attempt = async move {
-            let _lease = lease;
-            let queued = Instant::now();
-            let mut started = None;
-            tracing::debug!(%endpoint, "identity refresh queued");
-            // Queue-only timeouts are local pressure. Once admitted, even a
-            // total timeout interrupted during HTTP earns endpoint backoff.
-            let result =
-                std::panic::AssertUnwindSafe(tokio::time::timeout(policy.deadline, async {
-                    let _http = limits
-                        .inner
-                        .http
-                        .acquire()
-                        .await
-                        .expect("HTTP budget stays open");
-                    started = Some(Instant::now());
-                    tracing::debug!(%endpoint, "identity fetch started");
-                    fetch().await
-                }))
-                .catch_unwind()
-                .await;
-            let (result, backoff) = match result {
-                Ok(Ok(result)) => (result, true),
-                Ok(Err(_)) => (
-                    Err(Error::Unavailable("identity refresh timed out".into())),
-                    started.is_some(),
-                ),
-                Err(_) => (
-                    Err(Error::Unavailable(
-                        "identity refresh failed internally".into(),
-                    )),
-                    true,
-                ),
-            };
-            let mut state = cell.state.lock().unwrap();
-            state.inflight = None;
-            let result = result.map(|value| match state.value.take() {
-                // An unchanged response keeps its revision, so refreshes forced
-                // by unknown key IDs do not invalidate reused signature checks.
-                Some(previous) if previous.value == value => Arc::new(Cached {
-                    value,
-                    fetched_at: Instant::now(),
-                    revision: previous.revision,
-                }),
-                _ => Arc::new(Cached {
-                    value,
-                    fetched_at: Instant::now(),
-                    revision: NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
-                }),
-            });
-            match &result {
-                Ok(value) => {
-                    state.value = Some(value.clone());
-                    state.failure = None;
-                }
-                Err(error) if backoff && !policy.cooldown.is_zero() => {
-                    state.failure = Some((Instant::now() + policy.cooldown, error.clone()));
-                }
-                Err(_) => {}
-            }
-            drop(state);
-            let queue_ms = started
-                .unwrap_or_else(Instant::now)
-                .duration_since(queued)
-                .as_millis() as u64;
-            let fetch_ms = started
-                .map(|at| at.elapsed().as_millis() as u64)
-                .unwrap_or(0);
-            match &result {
-                Ok(_) => tracing::debug!(
-                    %endpoint, queue_ms, fetch_ms, "identity refresh completed"
-                ),
-                Err(error) => tracing::warn!(
-                    %endpoint, %error, queue_ms, fetch_ms,
-                    cooldown = backoff, "identity refresh failed"
-                ),
-            }
-            result
-        }
-        .boxed()
-        .shared();
-        let driver = attempt.clone();
-        tokio::spawn(async move {
-            let _ = driver.await;
+fn start<T, F, Fut>(
+    cell: Cell<T>,
+    endpoint: String,
+    limits: SharedLimits,
+    policy: Policy,
+    lease: OwnedSemaphorePermit,
+    fetch: F,
+) -> Attempt<T>
+where
+    T: PartialEq + Send + Sync + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T>> + Send + 'static,
+{
+    let attempt = async move {
+        let _lease = lease;
+        let queued = Instant::now();
+        let mut started = None;
+        tracing::debug!(%endpoint, "identity refresh queued");
+        // Queue-only timeouts are local pressure. Once admitted, even a
+        // total timeout interrupted during HTTP earns endpoint backoff.
+        let result = std::panic::AssertUnwindSafe(tokio::time::timeout(policy.deadline, async {
+            let _http = limits
+                .inner
+                .http
+                .acquire()
+                .await
+                .expect("HTTP budget stays open");
+            started = Some(Instant::now());
+            tracing::debug!(%endpoint, "identity fetch started");
+            fetch().await
+        }))
+        .catch_unwind()
+        .await;
+        let (result, backoff) = match result {
+            Ok(Ok(result)) => (result, true),
+            Ok(Err(_)) => (
+                Err(Error::Unavailable("identity refresh timed out".into())),
+                started.is_some(),
+            ),
+            Err(_) => (
+                Err(Error::Unavailable(
+                    "identity refresh failed internally".into(),
+                )),
+                true,
+            ),
+        };
+        let mut state = cell.lock().unwrap();
+        state.inflight = None;
+        // Age keysets from the request start, which the response is at
+        // least as fresh as; HTTP latency then never extends the window.
+        let fetched_at = started.unwrap_or_else(Instant::now);
+        let result = result.map(|value| match state.value.take() {
+            // An unchanged response keeps its revision, so refreshes forced
+            // by unknown key IDs do not invalidate reused signature checks.
+            Some(previous) if previous.value == value => Arc::new(Cached {
+                value,
+                fetched_at,
+                revision: previous.revision,
+            }),
+            _ => Arc::new(Cached {
+                value,
+                fetched_at,
+                revision: NEXT_REVISION.fetch_add(1, Ordering::Relaxed),
+            }),
         });
-        attempt
+        match &result {
+            Ok(value) => {
+                state.value = Some(value.clone());
+                state.failure = None;
+            }
+            Err(error) if backoff && !policy.cooldown.is_zero() => {
+                state.failure = Some((Instant::now() + policy.cooldown, error.clone()));
+            }
+            Err(_) => {}
+        }
+        drop(state);
+        let queue_ms = started
+            .unwrap_or_else(Instant::now)
+            .duration_since(queued)
+            .as_millis() as u64;
+        let fetch_ms = started
+            .map(|at| at.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        match &result {
+            Ok(_) => tracing::debug!(
+                %endpoint, queue_ms, fetch_ms, "identity refresh completed"
+            ),
+            Err(error) => tracing::warn!(
+                %endpoint, %error, queue_ms, fetch_ms,
+                cooldown = backoff, "identity refresh failed"
+            ),
+        }
+        result
     }
+    .boxed()
+    .shared();
+    let driver = attempt.clone();
+    tokio::spawn(async move {
+        let _ = driver.await;
+    });
+    attempt
 }
 
 #[cfg(test)]
@@ -232,7 +225,6 @@ mod tests {
         Arc::new(EndpointCache::new(
             SharedLimits::unchecked(http, refreshes),
             Policy {
-                capacity: 1024,
                 deadline: REFRESH_TIMEOUT,
                 cooldown: FAILURE_COOLDOWN,
             },
@@ -412,7 +404,6 @@ mod tests {
         let cache = Arc::new(EndpointCache::new(
             SharedLimits::unchecked(1, 1),
             Policy {
-                capacity: 1024,
                 deadline: REFRESH_TIMEOUT,
                 cooldown: Duration::ZERO,
             },
@@ -433,22 +424,5 @@ mod tests {
                 .value,
             7
         );
-    }
-
-    #[tokio::test]
-    async fn endpoint_capacity_is_enforced() {
-        let cache = Arc::new(EndpointCache::new(
-            SharedLimits::unchecked(1, 1),
-            Policy {
-                capacity: 1,
-                deadline: REFRESH_TIMEOUT,
-                cooldown: FAILURE_COOLDOWN,
-            },
-        ));
-        assert!(cache.get("a", |_| true, || async { Ok(1) }).await.is_ok());
-        assert!(matches!(
-            cache.get("b", |_| true, || async { Ok(2) }).await,
-            Err(Error::Unavailable(_))
-        ));
     }
 }
