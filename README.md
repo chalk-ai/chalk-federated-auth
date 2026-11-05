@@ -59,7 +59,7 @@ historical `[[oidc_issuers]]` TOML sections.
   issuer config, so an attacker cannot downgrade an RS256 issuer to HS256:
   `DecodingKey::from_jwk` keys only verify the JWK's key family.
 - An unknown `kid` triggers a shared JWKS refresh, at most once per second per
-  endpoint. If the refreshed keyset, or one fetched within the last second,
+  endpoint. If the refreshed keyset, or one requested within the last second,
   lacks the key, the token is rejected with `Error::Auth`. If a fetch failure,
   timeout, or capacity limit prevents the check, the result is
   `Error::Unavailable`. Issuers must publish a key before signing with it: a
@@ -69,9 +69,9 @@ historical `[[oidc_issuers]]` TOML sections.
 
 Construct one registry and share it. Discovery and JWKS loads coalesce by trusted
 endpoint and continue in the background if a caller disconnects or times out.
-Callers that join a load do not consume admission slots. By default each registry
-tracks up to 1,024 endpoints, and the process allows 256 active or queued endpoint
-loads and 16 concurrent HTTP requests with FIFO admission. HTTP requests time out
+Callers that join a load do not consume admission slots. By default the process
+allows 256 active or queued endpoint loads and 16 concurrent HTTP requests with
+FIFO admission. HTTP requests time out
 after two seconds; each endpoint load and each `try_validate` call have a
 three-second deadline. Failed HTTP calls, and loads that time out after HTTP
 admission, back off for one second. Queue-only timeouts and local admission
