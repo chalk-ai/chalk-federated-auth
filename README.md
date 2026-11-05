@@ -39,7 +39,8 @@ let registry = OidcRegistry::from_config(&[
 match registry.try_validate(bearer_token).await {
     None => { /* token's `iss` is not a trusted issuer — fall back to your own auth */ }
     Some(Ok(claims)) => { /* authenticated; claims.sub is the Chalk user id */ }
-    Some(Err(e)) => { /* token claimed a trusted issuer but failed validation — reject */ }
+    Some(Err(chalk_federated_auth::Error::Unavailable(e))) => { /* retryable identity infrastructure/overload error; e.g. HTTP 503 */ }
+    Some(Err(e)) => { /* invalid credentials — reject */ }
 }
 ```
 
@@ -57,7 +58,74 @@ historical `[[oidc_issuers]]` TOML sections.
 - The signing algorithm is taken from the token header but the key is fixed by
   issuer config, so an attacker cannot downgrade an RS256 issuer to HS256:
   `DecodingKey::from_jwk` keys only verify the JWK's key family.
-- Unknown `kid`s trigger one JWKS refetch (key rotation) before rejecting.
+- An unknown `kid` triggers a shared JWKS refresh, at most once per second per
+  endpoint. If the refreshed keyset, or one requested within the last second,
+  lacks the key, the token is rejected with `Error::Auth`. If a fetch failure,
+  timeout, or capacity limit prevents the check, the result is
+  `Error::Unavailable`. Issuers must publish a key before signing with it: a
+  token signed with a key published within the last second can be rejected.
+
+### Refreshes and verification
+
+Construct one registry and share it. Discovery and JWKS loads coalesce by trusted
+endpoint and continue in the background if a caller disconnects or times out.
+Callers that join a load do not consume admission slots. By default the process
+allows 256 active or queued endpoint loads and 16 concurrent HTTP requests with
+FIFO admission. HTTP requests time out
+after two seconds; each endpoint load and each `try_validate` call have a
+three-second deadline. Failed HTTP calls, and loads that time out after HTTP
+admission, back off for one second. Queue-only timeouts and local admission
+failures do not mark an endpoint failed.
+
+Fresh known signing keys bypass refresh, even while a rotation fetch is running
+or failing. Keysets expire after 300 seconds and then require a successful
+refresh; expired keys are not reused during outages. A successful refresh
+replaces the keyset, including removing keys the issuer no longer publishes. A
+refresh that returns the same keyset keeps its revision.
+
+Signature checks run inline once keys are resolved. Successful results are reused
+for one second, keyed by token digest and keyset revision, with expiry checked on
+every reuse; failures are not cached. Key resolution always runs first, so reuse
+cannot bypass expired or replaced keys. Each registry caches at most 4,096
+results; when full, new results are simply not cached, and requests are never
+rejected for cache capacity. The library logs no tokens or unverified claims;
+error messages name the requested `kid` and JWKS URL.
+
+`Error::Auth` means credential validation failed. `Error::Unavailable` means the
+caller should retry: identity infrastructure, local capacity, or a deadline
+prevented validation. `Error` is `#[non_exhaustive]`, so matches need a wildcard
+arm. Structured tracing events report refresh admission, completion, queue/fetch
+durations, and failure cooldown once per load, rather than once per waiting token.
+
+### Options
+
+`OidcRegistry::with_options` takes a `RegistryOptions`; `from_config` uses the
+defaults above. Start from `RegistryOptions::default()` and assign the fields to
+change:
+
+```rust
+use chalk_federated_auth::{OidcRegistry, RegistryOptions, SharedLimits};
+
+let mut options = RegistryOptions::default();
+options.validate_deadline = None; // the service applies its own request deadline
+options.limits = SharedLimits::new(8, 128)?; // share this handle across registries
+let registry = OidcRegistry::with_options(&issuers, options)?;
+```
+
+| Field | Default | Rule |
+|---|---|---|
+| `http_timeout` | 2s | positive |
+| `refresh_deadline` | 3s | greater than `http_timeout` |
+| `validate_deadline` | `Some(3s)` | positive; `None` leaves it to the caller |
+| `failure_cooldown` | 1s | less than `jwks_ttl`; zero disables backoff |
+| `jwks_ttl` | 300s | greater than the 1s unknown-kid cooldown; at most 24h |
+| `result_cache_capacity` | 4,096 | zero disables result reuse |
+| `result_cache_ttl` | 1s | at most 60s; zero disables result reuse |
+| `limits` | `SharedLimits::global()` | `SharedLimits::new(http_calls, refresh_owners)` requires `1 <= http_calls <= refresh_owners` |
+
+Registries holding the same `SharedLimits` handle share its HTTP and refresh
+budgets; the global handle is shared by every registry that does not set one.
+Invalid combinations fail with `Error::Config` when the registry is built.
 
 ## chalk-permission-claims
 

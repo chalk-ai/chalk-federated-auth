@@ -113,6 +113,34 @@ async fn wrong_secret_rejected() {
 }
 
 #[tokio::test]
+async fn verification_results_are_isolated_between_registries() {
+    let trusted = OidcRegistry::from_config(&[secret_issuer(
+        "shared-issuer",
+        "FED_TEST_ISOLATION_TRUSTED",
+        "right",
+    )])
+    .unwrap();
+    let other = OidcRegistry::from_config(&[secret_issuer(
+        "shared-issuer",
+        "FED_TEST_ISOLATION_OTHER",
+        "wrong",
+    )])
+    .unwrap();
+    let token = hs256_token(
+        "right",
+        &serde_json::json!({
+            "iss": "shared-issuer", "sub": "user", "exp": future_exp(),
+        }),
+    );
+    assert!(trusted.try_validate(&token).await.unwrap().is_ok());
+    assert!(matches!(
+        other.try_validate(&token).await,
+        Some(Err(chalk_federated_auth::Error::Auth(_)))
+    ));
+    assert!(trusted.try_validate(&token).await.unwrap().is_ok());
+}
+
+#[tokio::test]
 async fn expired_token_rejected() {
     let config = secret_issuer("chalk-test-expired", "FED_TEST_SECRET_D", "s3cret");
     let registry = OidcRegistry::from_config(&[config]).expect("registry");
